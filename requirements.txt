@@ -1,0 +1,12 @@
+# --- PDF handling ---
+PyMuPDF>=1.24.9          # used by detector.py, digital_extractor.py
+pypdfium2>=4.30.0        # used by scanned_extractor.py (page -> image rendering)
+Pillow>=10.3.0
+
+# --- OCR (scanned PDFs) ---
+surya-ocr==0.17.0
+transformers<5.0         # surya-ocr 0.17.0 breaks on transformers 5.x
+
+# --- LLM (Gemini) ---
+google-genai>=0.3.0      # was missing - config.py does `from google import genai`
+python-dotenv>=1.0.0
