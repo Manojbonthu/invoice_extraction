@@ -7,12 +7,19 @@ Removes block/box-drawing characters (block glyphs).
 Returns dict: {"tables": [{"headers": [...], "rows": [[...]]}, ...], "texts": [...]}
 This is the JSON/table format that gets sent to the LLM via
 llm_extractor.format_data_for_llm() / get_invoice_json_from_data().
+
+UPDATED: added render_page_images() for the Gemma vision fallback. Digital
+PDFs don't render page images by default (unlike scanned, which already
+renders for OCR) — this is only called lazily, when a null field actually
+needs the fallback, to avoid wasted render cost on the common case.
 """
 
 import os
 import re
+import io
 import fitz
 from typing import List, Dict, Any
+from PIL import Image
 
 # --- Block character filter ------------------------------------------------
 BLOCK_CHARS_RE = re.compile(r'[█▀▄▌▐░▒▓⎔▬►▼◄◆◇●○■□]')
@@ -25,6 +32,27 @@ def clean_span_text(text: str) -> str:
     cleaned = BLOCK_CHARS_RE.sub(' ', text)
     cleaned = re.sub(r'\s+', ' ', cleaned)
     return cleaned.strip()
+
+
+# --- NEW: lazy page-image rendering for Gemma vision fallback --------------
+def render_page_images(pdf_path: str, dpi: int = 200) -> List[Image.Image]:
+    """
+    Render each page of a digital PDF to a PIL image. Only called on-demand
+    from get_invoice_json_from_data() when a field is still null after the
+    Gemini text pass — most digital PDFs never need this.
+    """
+    doc = fitz.open(pdf_path)
+    images = []
+    try:
+        zoom = dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            images.append(Image.open(io.BytesIO(img_bytes)))
+    finally:
+        doc.close()
+    return images
 
 
 # --- PHASE 1: table detection (math-based, no keywords) --------------------
@@ -105,6 +133,8 @@ def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
     """
     Extract clean tables and text from a digital PDF.
     Returns: {"tables": [{"headers": [...], "rows": [[...]]}, ...], "texts": [...]}
+    Note: no "images" key here (unlike scanned) — call render_page_images()
+    separately, lazily, only if the Gemma vision fallback is needed.
     """
     doc = fitz.open(pdf_path)
     result = {"tables": [], "texts": []}

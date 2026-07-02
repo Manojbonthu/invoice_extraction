@@ -1,17 +1,20 @@
 """
 run.py - Full pipeline, per PDF. Both digital and scanned now produce the
-SAME dict schema {"tables": [...], "texts": [...]}, so both go through the
-same LLM pathway (get_invoice_json_from_data / format_data_for_llm).
+SAME dict schema {"tables": [...], "texts": [...]} (+ "images" for scanned),
+so both go through the same LLM pathway (get_invoice_json_from_data /
+format_data_for_llm), which now also runs a Gemma vision fallback for any
+hsn_sac/item_code still null after RuleEngine validation.
 
   DIGITAL:  digital_extractor.extract_digital_clean()  -> dict
-  SCANNED:  scanned_extractor.extract_scanned_clean()   -> dict (table
-            structure reconstructed from Surya OCR line-bboxes)
+  SCANNED:  scanned_extractor.extract_scanned_clean()   -> dict (+ images,
+            already rendered for OCR, reused for the Gemma fallback)
 
 Both paths:
   1. Detect type
   2. Extract -> dict
-  3. Save raw extraction  -> Output_Folder/JSON_Raw/<name>.json
-  4. Send dict to Gemini (format_data_for_llm), validate with RuleEngine
+  3. Save raw extraction  -> Output_Folder/JSON_Raw/<name>.json (images excluded)
+  4. Send dict to Gemini (format_data_for_llm), validate with RuleEngine,
+     Gemma vision fallback if still null
   5. Save clean JSON      -> Output_Folder/JSON/<name>.json
 
 Usage:
@@ -72,16 +75,17 @@ def process_pdf(pdf_path: Path) -> bool:
 
     print(f"Extracted: {len(data.get('tables', []))} tables, {len(data.get('texts', []))} text blocks")
 
-    # 3. Save raw extraction
+    # 3. Save raw extraction (exclude "images" — PIL images aren't JSON-serializable)
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
     JSON_RAW_FOLDER.mkdir(parents=True, exist_ok=True)
     raw_path = JSON_RAW_FOLDER / f"{doc_id}.json"
-    raw_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    raw_for_disk = {k: v for k, v in data.items() if k != "images"}
+    raw_path.write_text(json.dumps(raw_for_disk, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Saved RAW JSON: {raw_path}")
 
-    # 4. Send dict to Gemini
+    # 4. Send dict to Gemini (+ Gemma vision fallback if needed)
     try:
-        result = get_invoice_json_from_data(data)
+        result = get_invoice_json_from_data(data, pdf_path=str(pdf_path))
     except Exception as e:
         print(f"LLM extraction failed: {e}")
         return False
@@ -97,7 +101,7 @@ def process_pdf(pdf_path: Path) -> bool:
 
 def main():
     print("=" * 60)
-    print("FULL PIPELINE (Digital + Scanned: Tables/JSON) -> LLM -> JSON")
+    print("FULL PIPELINE (Digital + Scanned) -> LLM -> Gemma Vision Fallback -> JSON")
     print("=" * 60)
 
     if len(sys.argv) > 1:

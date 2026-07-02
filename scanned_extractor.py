@@ -1,10 +1,14 @@
 """
 scanned_extractor.py - Extract plain OCR text from scanned PDFs using Surya OCR 0.17.0.
-Returns flat text only (no table reconstruction). Table/column ambiguity is
+Returns flat text + page images (dict schema). Table/column ambiguity is
 handled downstream by a dedicated, more detailed LLM prompt instead
-(see llm_extractor.SCANNED_SYSTEM_PROMPT) - which turned out to be more
+(see llm_extractor.SYSTEM_PROMPT) - which turned out to be more
 reliable than trying to geometrically reconstruct tables from line-level
 OCR bboxes.
+
+UPDATED: extract_scanned_clean() now also returns the rendered page images
+(already computed for OCR, previously discarded) so they're available for
+the Gemma vision fallback without a second render pass.
 """
 
 import re
@@ -94,12 +98,16 @@ def _lines_to_paragraphs(page_pred) -> List[str]:
 def extract_scanned_clean(pdf_path: str, dpi: int = 150) -> Dict[str, Any]:
     """
     Extract plain OCR text from a scanned PDF.
-    Returns: {"tables": [], "texts": [{"type": "text"/"heading", "text": "..."}]}
+    Returns: {"tables": [], "texts": [{"type": "text"/"heading", "text": "..."}],
+              "images": [PIL.Image, ...]}
+    The images are the same page renders already used for OCR — kept here
+    instead of discarded, so the Gemma vision fallback can reuse them
+    without re-rendering the PDF.
     """
     recognition_predictor, detection_predictor = _get_predictors()
     images = pdf_to_images(pdf_path, dpi=dpi)
 
-    result: Dict[str, Any] = {"tables": [], "texts": []}
+    result: Dict[str, Any] = {"tables": [], "texts": [], "images": images}
 
     for img in images:
         page_preds = recognition_predictor([img], det_predictor=detection_predictor)
@@ -117,7 +125,7 @@ def extract_scanned_clean(pdf_path: str, dpi: int = 150) -> Dict[str, Any]:
 def extract_scanned_text_only(pdf_path: str, dpi: int = 150) -> str:
     """
     Convenience function: return scanned PDF as a single plain-text string
-    (no dict wrapper). This is what gets sent to the LLM.
+    (no dict wrapper). This is what gets sent to the LLM in text-only mode.
     """
     data = extract_scanned_clean(pdf_path, dpi=dpi)
     return "\n".join(t["text"] for t in data["texts"])
