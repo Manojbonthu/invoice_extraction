@@ -223,6 +223,5 @@ This loads the already-saved raw extraction, re-runs the Gemini + RuleEngine
 | `rule_engine.py` | Field validation (hsn_sac, item_code), tax computation, HSN regex fallback |
 | `run.py` | Orchestrates the full per-PDF pipeline, batch or single-file |
 | `test_gemma_fallback.py` | Standalone test: raw JSON → LLM → Gemma fallback, no re-extraction |
-| `test_pdf.py` | ⚠️ Currently broken — imports functions removed from `digital_extractor.py` |
 | `schemas.py` | `NormalizedBlock`/`SourceRef` dataclasses (legacy extractor wrapper) |
 | `utils.py` | File/text/date helpers, retry decorator |
