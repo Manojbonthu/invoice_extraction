@@ -14,12 +14,9 @@ from config import get_llm_client, MODEL_NAME, MAX_OUTPUT_TOKENS, REQUEST_DELAY,
 
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash-lite")
 
-# ─── SYSTEM PROMPT (unchanged from your last version) ──────────────────────
 SYSTEM_PROMPT = """You are an invoice extractor. Output JSON matching the schema below.
-
 If multiple distinct Invoice Numbers exist, return an array of objects.
 Otherwise, return a single object.
-
 Schema:
 {
   "Invoice Number": string or null,
@@ -36,22 +33,19 @@ Schema:
     }
   ]
 }
-
 Extraction Rules:
-
--1. Invoice Number:
+- **Invoice Number**:
    - Look for labels: "Invoice No", "SAPINV", "Invoice Number", "Inv No".
    - Keep the full string (e.g., "SAPINV/000798/26").
    - If multiple numbers exist, pick the one explicitly labelled as invoice.
    - Never use "LR No.", "Reference No.", "Order No.", or "Document No." unless no invoice label exists.
 - **Invoice Date**: Find in header, format dd/mm/yyyy.
-
 - **Total Payable**: Find in footer via "Grand Total", "Net Amount", "Total Payable". Use largest if multiple.
-
 - **Total Tax**: Find in footer via "Total Tax", "IGST Total", or sum CGST+SGST if given separately.
   If not explicitly provided, sum CGST and SGST (or use IGST) when available.
-
 - **Items**: From the ITEM TABLE. One object per row.
+- **item_name**: Extract product/description from the "Description of Goods" column. Do not use "Packing Details", "S.No.", or other unrelated fields. For scanned invoices, use the description near the rate/quantity. 
+Ignore section headings like "Processed Material" – the real description is a code like "IR.N1130.745" or like that appears in the same row as the quantity and rate.
 
 - **item_code**: Hunt for a 7-digit number (1000000-4999999) using labels:
   Product Code, Cust Item, MATERIAL CODE, PART NO, FG CODE, ITEM CODE, SKU, Input Code, Material Code, Cust. Item, Part No.
@@ -59,11 +53,10 @@ Extraction Rules:
   If none of those labels are found, scan the item_name/goods description for any 7-digit number starting with 1-4 and extract that as item_code.
   Extract if found, else null.
 
--- **hsn_sac**: Exactly 4,6,8 digits. Do not confuse with item_code. Look for labels: "HSN/SAC", "SAC CODE", "SAC", "HSN", "HSN Code or scan the item row for a 4/6/8 digit number.
+- **hsn_sac**: Exactly 4,6,8 digits. Do not confuse with item_code. Look for labels: "HSN/SAC", "SAC CODE", "SAC", "HSN", "HSN Code or scan the item row for a 4/6/8 digit number.
 
 All keys must be present. Use null for missing values. Numeric fields must be numbers, not strings.
-Output ONLY valid JSON. No markdown, no explanations.
-"""
+Output ONLY valid JSON. No markdown, no explanations."""
 
 # ─── NEW: Gemma vision fallback prompt ──────────────────────────────────────
 GEMMA_VISION_PROMPT_TEMPLATE = """You are looking at a scanned/photographed invoice page image.
