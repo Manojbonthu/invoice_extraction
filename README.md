@@ -204,10 +204,7 @@ This loads the already-saved raw extraction, re-runs the Gemini + RuleEngine
   Gemma's re-read finds a different item count, extras are logged and
   skipped rather than guessed at — check logs for
   `⚠️ Gemma returned fewer items than Gemini` if this happens.
-- **`test_pdf.py`** currently imports `extract_digital_text_only` /
-  `extract_scanned_text_only`, which no longer match the current dict-based
-  return shape of `digital_extractor.py` — needs updating separately from
-  the fallback feature (currently broken if run as-is).
+
 
 ---
 
@@ -223,4 +220,3 @@ This loads the already-saved raw extraction, re-runs the Gemini + RuleEngine
 | `rule_engine.py` | Field validation (hsn_sac, item_code), tax computation, HSN regex fallback |
 | `run.py` | Orchestrates the full per-PDF pipeline, batch or single-file |
 | `schemas.py` | `NormalizedBlock`/`SourceRef` dataclasses (legacy extractor wrapper) |
-| `utils.py` | File/text/date helpers, retry decorator |
