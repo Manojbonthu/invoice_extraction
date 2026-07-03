@@ -53,29 +53,46 @@ Ignore section headings like "Processed Material" – the real description is a 
   If none of those labels are found, scan the item_name/goods description for any 7-digit number starting with 1-4 and extract that as item_code.
   Extract if found, else null.
 
-- **hsn_sac**: Exactly 4,6,8 digits. Do not confuse with item_code. Look for labels: "HSN/SAC", "SAC CODE", "SAC", "HSN", "HSN Code or scan the item row for a 4/6/8 digit number.
+- **hsn_sac**: Exactly 4,6,8 digits. Do not confuse with item_code. Look for labels: "HSN/SAC", "SAC CODE", "SAC", "HSN", "HSN Code" or scan the item row for a 4/6/8 digit number.
 
 All keys must be present. Use null for missing values. Numeric fields must be numbers, not strings.
 Output ONLY valid JSON. No markdown, no explanations."""
 
-# ─── NEW: Gemma vision fallback prompt ──────────────────────────────────────
-GEMMA_VISION_PROMPT_TEMPLATE = """You are looking at a scanned/photographed invoice page image.
-Find the following missing field(s) for this specific line item on the page:
 
-Item description: {item_name}
-Missing field(s): {missing_fields}
+# --- Gemma vision fallback prompt -------------------------------------------
+# Asks for a FLAT {"hsn_sac": ..., "item_code": ...} shape that matches
+# exactly what extract_fields_with_gemma_vision() parses back out.
+
+GEMMA_VISION_PROMPT_TEMPLATE = """You are looking at a photograph/scan of an invoice page.
+
+The main extraction already ran for ONE specific line item and produced this data
+(some field(s) came back null and need to be found by looking directly at the image):
+
+Current extracted data for this item: {current_item_json}
+Field(s) still missing: {missing_fields}
+
+Look directly at the image, find the row on the invoice that matches this item
+(use "item_name" and any other known fields above to locate the correct row),
+and extract ONLY the missing field(s) listed above.
 
 Rules:
-- item_code: 7 digits, must start with 1-4 (range 1000000-4999999).
-  Look for labels: F.G Code, FG Code, Product Code, Cust Item, MATERIAL CODE,
-  PART NO, ITEM CODE, SKU, Input Code, Material Code, Part No.
-  Priority: if both "F.G Code" and "Input Code" appear, use F.G Code
-  (finished product code) — NOT Input Code.
-- hsn_sac: exactly 4, 6, or 8 digits. Look for labels: HSN/SAC, SAC CODE, SAC,
-  HSN, HSN Code. Never confuse with item_code (7 digits) or with Excise No /
-  EWB No / GST No — those are not hsn_sac even if the digit count matches.
+- **item_code**: 7 digits, must start with 1-4 (range 1000000-4999999). Look for labels:
+  Product Code, Cust Item, MATERIAL CODE, PART NO, FG CODE, ITEM CODE, SKU, Input Code,
+  Material Code, Part No. Priority: if both "FG Code" and "Input Code" appear, use FG Code
+  (finished product code) - NOT Input Code.
+  If no labelled code is found, look inside the goods/item description text itself for an
+  embedded code, especially patterns like "F-" or "FG" followed by digits (e.g. "F-2500828",
+  "3900==F-2005134") - take the 7-digit number that follows "F-" or "FG" as the item_code.
+- **hsn_sac**: Exactly 4, 6, or 8 digits. Do not confuse with item_code (7 digits) or with
+  Excise No / EWB No / GST No. Look for labels: "HSN/SAC", "SAC CODE", "SAC", "HSN", "HSN Code".
+  If a single "HSN Code" appears once near the top/header of the invoice (not repeated per
+  item row), it applies to ALL items on that invoice — use that value.
 
-Return ONLY valid JSON in this exact shape, nothing else:
+Only return a value you can actually verify by looking at the image. If a field genuinely
+isn't visible/present anywhere on the page, return null for it - do not guess.
+
+Return ONLY valid JSON in this EXACT flat shape, nothing else, no other keys, no markdown
+fences, no explanation text before or after:
 {{"hsn_sac": <int or null>, "item_code": <int or null>}}
 """
 
@@ -172,14 +189,22 @@ def parse_response(response):
     return parsed, response.input_tokens, response.output_tokens, response.total_tokens
 
 
-# ─── NEW: Gemma vision fallback functions ───────────────────────────────────
+# ─── Gemma vision fallback functions ────────────────────────────────────────
 
-def extract_fields_with_gemma_vision(image, item_name: str, missing_fields: List[str], retries: int = 3):
+def extract_fields_with_gemma_vision(image, item_name: str, missing_fields: List[str],
+                                       current_item: dict = None, retries: int = 3):
     """
     Send a single page image + item context to the Gemma vision model,
     asking only for the specific missing field(s).
     Returns: {"hsn_sac": int|None, "item_code": int|None}
     Raises on total failure so the caller can decide how to handle it.
+
+    UPDATED: response.text can legitimately be None (e.g. if the model hit
+    the token limit before emitting text, or a safety filter fired) — now
+    checks for that explicitly and logs the finish_reason/safety_ratings
+    instead of crashing on .strip(). Also bumped max_output_tokens and
+    dropped the strict response_mime_type constraint, which Gemma may not
+    honor the same way Gemini does.
 
     NOTE: verify the image-part syntax below against your installed
     google-genai SDK version — this has changed across SDK releases.
@@ -188,8 +213,10 @@ def extract_fields_with_gemma_vision(image, item_name: str, missing_fields: List
     from google.genai import types
 
     client = get_llm_client()
+
+    item_context = current_item if current_item is not None else {"item_name": item_name}
     prompt_text = GEMMA_VISION_PROMPT_TEMPLATE.format(
-        item_name=item_name or "unknown",
+        current_item_json=json.dumps(item_context, ensure_ascii=False),
         missing_fields=", ".join(missing_fields),
     )
 
@@ -208,14 +235,39 @@ def extract_fields_with_gemma_vision(image, item_name: str, missing_fields: List
                 ],
                 config={
                     "temperature": 0.0,
-                    "max_output_tokens": 500,
-                    "response_mime_type": "application/json",
+                    "max_output_tokens": 2048,  # bumped from 500 — avoids truncation-caused None text
                 },
             )
-            content = response.text.strip()
+
+            content = response.text
+
+            if content is None:
+                # Diagnose WHY there's no text instead of crashing blind on .strip()
+                finish_reason = None
+                safety_info = None
+                try:
+                    candidate = response.candidates[0] if response.candidates else None
+                    finish_reason = getattr(candidate, "finish_reason", None)
+                    safety_info = getattr(candidate, "safety_ratings", None)
+                except Exception:
+                    pass
+                print(f"⚠️ Gemma returned no text. finish_reason={finish_reason}, "
+                      f"safety_ratings={safety_info}")
+                raise ValueError(f"Gemma response had no text (finish_reason={finish_reason})")
+
+            content = content.strip()
             content = re.sub(r'^```json\s*', '', content)
             content = re.sub(r'\s*```$', '', content)
-            parsed = json.loads(content)
+
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                else:
+                    raise ValueError(f"Invalid JSON from Gemma: {content[:200]}")
+
             return {
                 "hsn_sac": parsed.get("hsn_sac"),
                 "item_code": parsed.get("item_code"),
@@ -259,7 +311,7 @@ def apply_gemma_vision_fallback(invoices: list, images: list) -> list:
 
             try:
                 result = extract_fields_with_gemma_vision(
-                    page_image, item.get("item_name"), missing
+                    page_image, item.get("item_name"), missing, current_item=item
                 )
             except Exception as e:
                 print(f"⚠️ Gemma vision fallback failed for item "
@@ -356,7 +408,11 @@ def get_invoice_json_from_data(data: Dict[str, Any], pdf_path: str = None):
                 images = []
 
         if images:
-            print(f"🔍 {sum(1 for inv in invoices for item in inv.get('Invoice Items', []) if item.get('hsn_sac') is None or item.get('item_code') is None)} field(s) still null — trying Gemma vision fallback")
+            null_count = sum(
+                1 for inv in invoices for item in inv.get("Invoice Items", [])
+                if item.get("hsn_sac") is None or item.get("item_code") is None
+            )
+            print(f"🔍 {null_count} field(s) still null — trying Gemma vision fallback")
             invoices = apply_gemma_vision_fallback(invoices, images)
         else:
             print("⚠️ Fields still null but no page images available for Gemma fallback")
