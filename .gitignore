@@ -37,9 +37,17 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Output folders (optional)
+# Output folders
 Output_Folder/
+
+# PDF folders
 PDF/
+PDF-2/
+PDF-3/
+PDF-4/
+
+# ZIP files
+*.zip
 
 # Python type checker
 .mypy_cache/
