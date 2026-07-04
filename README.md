@@ -213,7 +213,7 @@ if you prefer not to use the command line.)
 
 ---
 
-## Running this on AWS with a GPU (for the team lead / ops)
+## Running this on AWS with a GPU
 
 This section is the step-by-step for taking the code from this GitHub repo
 and running it live on an AWS GPU instance for a full production batch.
@@ -221,10 +221,7 @@ and running it live on an AWS GPU instance for a full production batch.
 ### 1. Choose the instance
 - **`g4dn.xlarge`** (NVIDIA T4) — good default balance of cost and speed.
 - **`g5.xlarge`** (NVIDIA A10G) — faster, higher cost, worth it for very
-  large batches or tight deadlines.
-- Use AWS's **Deep Learning AMI (Ubuntu 22.04)** as the base image — it
-  ships with NVIDIA drivers and CUDA already installed, avoiding a manual
-  driver-install step.
+
 
 ### 2. Launch & connect
 - Security group: allow inbound **SSH (port 22)** from your IP only — this
