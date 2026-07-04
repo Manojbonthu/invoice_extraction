@@ -1,7 +1,16 @@
-"""Detect if a PDF is digital, scanned, or mixed (per-page)."""
+"""Detect if a PDF is digital, scanned, or mixed (per-page).
 
+WHAT'S NEW (in simple words):
+  Just one change here — uses proper logging (logger) now instead of
+  print(), so these messages get saved into the log file too, not just
+  shown on screen and then lost.
+"""
+
+import logging
 import fitz
 from typing import Tuple, List
+
+logger = logging.getLogger(__name__)
 
 
 def detect_pdf_type(file_path: str) -> Tuple[str, List[str]]:
@@ -14,7 +23,7 @@ def detect_pdf_type(file_path: str) -> Tuple[str, List[str]]:
             text_len = len(text)
             page_type = "digital" if text_len > 5 else "scanned"
             per_page.append(page_type)
-            print(f"Page {page_num+1}: {page_type} ({text_len} chars)")
+            logger.debug(f"Page {page_num + 1}: {page_type} ({text_len} chars)")
     finally:
         doc.close()
 
@@ -25,5 +34,5 @@ def detect_pdf_type(file_path: str) -> Tuple[str, List[str]]:
     else:
         overall = "mixed"
 
-    print(f"\nOverall PDF type: {overall}")
+    logger.info(f"{file_path}: overall PDF type = {overall} ({len(per_page)} page(s))")
     return overall, per_page

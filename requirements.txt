@@ -1,12 +1,24 @@
 # --- PDF handling ---
-PyMuPDF>=1.24.9          # used by detector.py, digital_extractor.py
-pypdfium2>=4.30.0        # used by scanned_extractor.py (page -> image rendering)
-Pillow>=10.3.0
+PyMuPDF==1.24.9           # used by detector.py, digital_extractor.py
+pypdfium2==4.30.0         # used by scanned_extractor.py (page -> image rendering)
+Pillow==10.3.0
 
 # --- OCR (scanned PDFs) ---
 surya-ocr==0.17.0
-transformers<5.0         # surya-ocr 0.17.0 breaks on transformers 5.x
+transformers==4.44.2      # surya-ocr 0.17.0 breaks on transformers 5.x — keep pinned below 5.0
+
+# --- Device detection (CPU/GPU) — used by config.py to check torch.cuda.is_available() ---
+# IMPORTANT: this line installs the CPU-only build by default, which works
+# on any machine (including your 8GB laptop) with no extra setup.
+#
+# this line (do not install both) — e.g. for CUDA 12.1:
+#   pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+# Check your server's CUDA version first and match the index-url to it.
+torch==2.3.1
 
 # --- LLM (Gemini) ---
-google-genai>=0.3.0      # was missing - config.py does `from google import genai`
-python-dotenv>=1.0.0
+google-genai==1.2.0       # config.py does `from google import genai`
+python-dotenv==1.0.1
+
+# --- Data validation ---
+pydantic==2.7.4           # used by schemas.py (Invoice/InvoiceItem shape checking)

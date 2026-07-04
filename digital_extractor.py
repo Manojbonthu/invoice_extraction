@@ -1,25 +1,32 @@
 """
-digital_extractor.py - Extract tables and text from digital PDFs.
-Removes block/box-drawing characters (block glyphs).
-  - Phase 1: Math-based table detection (no hardcoded keywords)
-  - Phase 2: Extract ALL text (no overlap skipping)
+digital_extractor.py - Reads tables and text directly out of DIGITAL PDFs
+(PDFs that already have real, selectable text in them — not scanned
+pictures). This is much faster and more accurate than OCR, when it works.
 
-Returns dict: {"tables": [{"headers": [...], "rows": [[...]]}, ...], "texts": [...]}
-This is the JSON/table format that gets sent to the LLM via
-llm_extractor.format_data_for_llm() / get_invoice_json_from_data().
-
-UPDATED: added render_page_images() for the Gemma vision fallback. Digital
-PDFs don't render page images by default (unlike scanned, which already
-renders for OCR) — this is only called lazily, when a null field actually
-needs the fallback, to avoid wasted render cost on the common case.
+WHAT'S NEW (in simple words):
+  1. Uses proper logging now (logger) instead of print().
+  2. Reads DPI (image sharpness) from config.py instead of a hardcoded
+     number, so it matches whatever your CPU/GPU settings say.
+  3. Every text block and table now remembers which PAGE it came from
+     (just like scanned_extractor.py now does). This is needed for
+     multi-page invoices, so the Gemma vision fallback in
+     llm_extractor.py knows exactly which page image to check.
+  4. render_page_images() now also uses config.OCR_DPI as its default,
+     so digital and scanned PDFs render pages at a consistent,
+     device-appropriate resolution.
 """
 
 import os
 import re
 import io
+import logging
 import fitz
 from typing import List, Dict, Any
 from PIL import Image
+
+import config
+
+logger = logging.getLogger(__name__)
 
 # --- Block character filter ------------------------------------------------
 BLOCK_CHARS_RE = re.compile(r'[█▀▄▌▐░▒▓⎔▬►▼◄◆◇●○■□]')
@@ -34,13 +41,19 @@ def clean_span_text(text: str) -> str:
     return cleaned.strip()
 
 
-# --- NEW: lazy page-image rendering for Gemma vision fallback --------------
-def render_page_images(pdf_path: str, dpi: int = 200) -> List[Image.Image]:
+# --- Lazy page-image rendering for the Gemma vision fallback ---------------
+def render_page_images(pdf_path: str, dpi: int = None) -> List[Image.Image]:
     """
-    Render each page of a digital PDF to a PIL image. Only called on-demand
-    from get_invoice_json_from_data() when a field is still null after the
-    Gemini text pass — most digital PDFs never need this.
+    Turns each page of a digital PDF into a picture (image). Only called
+    on-demand from llm_extractor.py when a field is still missing after
+    the Gemini text pass — most digital PDFs never need this, since the
+    text pass usually finds everything.
+
+    dpi (sharpness) defaults to config.OCR_DPI if not given, so digital
+    and scanned PDFs use a consistent, device-appropriate resolution
+    (lower on CPU to save memory/time, higher on GPU).
     """
+    dpi = dpi or config.OCR_DPI
     doc = fitz.open(pdf_path)
     images = []
     try:
@@ -52,6 +65,8 @@ def render_page_images(pdf_path: str, dpi: int = 200) -> List[Image.Image]:
             images.append(Image.open(io.BytesIO(img_bytes)))
     finally:
         doc.close()
+    logger.info(f"Rendered {len(images)} page image(s) from {pdf_path} at {dpi} DPI "
+                f"for the Gemma vision fallback")
     return images
 
 
@@ -132,7 +147,17 @@ def _extract_all_text_blocks(page, table_bboxes: List = None):
 def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
     """
     Extract clean tables and text from a digital PDF.
-    Returns: {"tables": [{"headers": [...], "rows": [[...]]}, ...], "texts": [...]}
+
+    Returns: {
+        "tables": [{"headers": [...], "rows": [[...]], "page": 1}, ...],
+        "texts": [{"type": "text"/"heading", "text": "...", "page": 1}, ...]
+    }
+
+    Every table and text block now includes a "page" number (starting at
+    1), matching what scanned_extractor.py does — needed so the Gemma
+    vision fallback in llm_extractor.py knows which page image to check
+    if a field turns out to be missing.
+
     Note: no "images" key here (unlike scanned) — call render_page_images()
     separately, lazily, only if the Gemma vision fallback is needed.
     """
@@ -140,7 +165,7 @@ def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
     result = {"tables": [], "texts": []}
 
     try:
-        for page in doc:
+        for page_index, page in enumerate(doc, start=1):
             table_bboxes = []
 
             # Table extraction (math-based filtering)
@@ -167,13 +192,15 @@ def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
                         result["tables"].append({
                             "headers": headers,
                             "rows": rows,
+                            "page": page_index,
                         })
                     else:
                         if headers or rows:
-                            print(f"  Skipped small/sparse table (cols:{len(headers)}, rows:{len(rows)})")
+                            logger.debug(f"Skipped small/sparse table on page {page_index} "
+                                         f"(cols:{len(headers)}, rows:{len(rows)})")
 
             except Exception as e:
-                print(f"  Table extraction error: {e}")
+                logger.warning(f"Table extraction error on page {page_index} of {pdf_path}: {e}")
                 continue
 
             # Extract ALL text (no overlap skipping)
@@ -183,14 +210,18 @@ def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
                     result["texts"].append({
                         "type": block["type"],
                         "text": block["text"],
+                        "page": page_index,
                     })
             except Exception as e:
-                print(f"  Text extraction error: {e}")
+                logger.warning(f"Text extraction error on page {page_index} of {pdf_path}: {e}")
                 continue
 
     finally:
         doc.close()
 
+    logger.info(f"Digital extraction finished for {pdf_path}: "
+                f"{len(result['tables'])} table(s), {len(result['texts'])} text block(s) "
+                f"across {len(doc)} page(s)")
     return result
 
 
@@ -219,7 +250,7 @@ def extract_digital(pdf_path: str, document_id: str = "default") -> List[Normali
             type="table",
             text="\n".join(md_parts),
             table_data={"headers": headers, "rows": rows},
-            source_ref=SourceRef(filename=filename, page=1),
+            source_ref=SourceRef(filename=filename, page=table.get("page", 1)),
             confidence=0.95,
         ))
 
@@ -229,7 +260,7 @@ def extract_digital(pdf_path: str, document_id: str = "default") -> List[Normali
             document_id=document_id,
             type=text["type"],
             text=text["text"],
-            source_ref=SourceRef(filename=filename, page=1),
+            source_ref=SourceRef(filename=filename, page=text.get("page", 1)),
             confidence=1.0,
         ))
 
