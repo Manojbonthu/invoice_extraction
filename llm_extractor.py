@@ -1,52 +1,47 @@
 """
-llm_extractor.py - Sends invoice data to Gemini (main AI) to get structured
-JSON out of it, checks the answer with rule_engine.py, and if any field
-is still missing, sends the invoice PAGE IMAGE to Gemma (a vision AI that
-can "look" at pictures) as a fallback.
+llm_extractor.py - Sends invoice data to the active LLM provider (Gemini
+OR OpenAI, picked by config.LLM_PROVIDER) to get structured JSON, checks
+the answer with rule_engine.py, and if any field is still missing, sends
+the invoice PAGE IMAGE to a vision-capable model as a fallback.
 
-WHAT'S NEW (in simple words):
-  1. Uses proper logging now (logger) instead of print().
-  2. Every AI call now goes through the RATE LIMITER from config.py first,
-     so we never send more requests per minute than Google allows.
-  3. Retries are smarter: only retries on "try again later" type errors
-     (429 = too many requests, 503 = server busy, timeouts). Other errors
-     (like a broken request) fail immediately instead of wasting 8 retries
-     on something that will never succeed. Wait time between retries is
-     now capped (never waits forever) and has small random "jitter" added
-     (explained below).
-  4. Uses STRUCTURED OUTPUT: instead of just asking the AI nicely to
-     "please return JSON" and hoping, we tell Gemini the exact shape
-     (schema) the answer must be in. This makes broken/malformed answers
-     much rarer.
-  5. Calls the new RuleEngine "document-level HSN" rule BEFORE the
-     expensive Gemma image fallback — if that free rule already fixes the
-     missing HSN, we skip paying for an extra AI image call.
-  6. Gemma vision fallback now checks MULTIPLE PAGES if needed (not just
-     page 1), using the "page" number we now store on each text block.
-  7. Tracks how many tokens (pieces of text) and how much money each file
-     costs, using config.calculate_cost(), so you can see real spend.
+PROVIDER ABSTRACTION (NEW):
+  This file no longer talks to the google-genai SDK directly. Instead:
+    - call_api() is a thin dispatcher: it looks at config.LLM_PROVIDER
+      and hands off to _call_gemini_backend() or _call_openai_backend().
+    - Both backends return the exact same shape: (parsed_json, usage_dict).
+    - Everything else in this file (format_data_for_llm, RuleEngine
+      integration, the Gemma/GPT vision fallback loop, usage tracking)
+      is 100% provider-agnostic — it was written once and works with
+      whichever backend is active.
+    - Model names come from config.PRIMARY_MODEL / config.FALLBACK_MODEL /
+      config.VISION_MODEL, which config.py already resolved to the right
+      provider's model names.
 
-  FIXED (concurrency bug): usage/cost tracking used to live in ONE shared
-  module-level dict (_usage_totals), reset per file by run.py. Since
-  run.py processes many files at the SAME TIME with a thread pool, two
-  files finishing close together could reset/overwrite each other's
-  numbers — costs and token counts got attributed to the wrong file.
-  Usage is now returned directly from call_api() and accumulated in a
-  LOCAL variable inside get_invoice_json_from_data(), one per file, with
-  nothing shared between threads. get_invoice_json_from_data() now
-  returns (result, usage) instead of just result.
+  This means: developing locally against Gemini and deploying against
+  OpenAI in production requires ZERO changes to this file — only your
+  .env's LLM_PROVIDER setting changes.
 
-WHAT "jitter" MEANS (simple explanation):
-  If 20 files all get rate-limited at the exact same moment, and they all
-  wait exactly "4 seconds" before retrying, they'll all hit the server
-  again at the exact same instant — causing another pile-up. Jitter just
-  means adding a small random extra amount (like +0 to +1 second) so
-  retries spread out naturally instead of retrying in one big wave.
+WHAT'S STILL THE SAME AS BEFORE:
+  - Rate limiting before every call (config.get_limiter() picks the
+    right limiter for whichever provider/model is active).
+  - Smart retries: only on "try again later" errors (429/500/502/503,
+    timeouts), capped wait time, small random jitter.
+  - Structured output: Gemini uses response_schema, OpenAI uses strict
+    JSON Schema mode (response_format={"type": "json_schema", ...}) —
+    both force the model into the exact shape we need.
+  - Document-level HSN rule runs before the (paid) vision fallback.
+  - Multi-page vision fallback (tries page images in order until fields
+    are filled or pages run out).
+  - Per-file usage/cost tracking returned as a LOCAL value from
+    get_invoice_json_from_data() — NOT a shared global — so this is
+    still safe to call from many worker threads at once.
 """
 
 import re
+import io
 import json
 import time
+import base64
 import random
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,12 +53,13 @@ from digital_extractor import render_page_images
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
-# SCHEMA — the exact shape we want the AI's answer to be in.
-# Passing this to Gemini as "response_schema" means Gemini is forced to
-# answer in this shape, instead of us just hoping it follows instructions.
+# SCHEMAS — one per provider, since Gemini and OpenAI express
+# "nullable"/"optional" fields slightly differently in their structured
+# output formats.
 # ─────────────────────────────────────────────────────────
 
-INVOICE_RESPONSE_SCHEMA = {
+# Gemini's response_schema style: "nullable": True alongside "type".
+GEMINI_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
         "invoices": {
@@ -99,8 +95,55 @@ INVOICE_RESPONSE_SCHEMA = {
     "required": ["invoices"],
 }
 
+# OpenAI's "strict" structured output mode requires: every property
+# listed in "required" (even nullable ones, expressed as type: [X, "null"]),
+# and "additionalProperties": false on every object level.
+OPENAI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "invoices": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "Invoice Number": {"type": ["string", "null"]},
+                    "Invoice Date": {"type": ["string", "null"]},
+                    "Total Payable": {"type": ["number", "null"]},
+                    "Total Tax": {"type": ["number", "null"]},
+                    "CGST": {"type": ["number", "null"]},
+                    "SGST": {"type": ["number", "null"]},
+                    "IGST": {"type": ["number", "null"]},
+                    "Invoice Items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item_name": {"type": ["string", "null"]},
+                                "item_code": {"type": ["string", "null"]},
+                                "hsn_sac": {"type": ["string", "null"]},
+                                "quantity": {"type": ["number", "null"]},
+                                "rate": {"type": ["number", "null"]},
+                                "amount": {"type": ["number", "null"]},
+                            },
+                            "required": ["item_name", "item_code", "hsn_sac",
+                                         "quantity", "rate", "amount"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["Invoice Number", "Invoice Date", "Total Payable", "Total Tax",
+                             "CGST", "SGST", "IGST", "Invoice Items"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["invoices"],
+    "additionalProperties": False,
+}
+
 # ─────────────────────────────────────────────────────────
-# SYSTEM PROMPT — the instructions we give the AI every time.
+# SYSTEM PROMPT — the instructions we give the AI every time. Same
+# prompt for both providers; it's provider-agnostic text.
 # ─────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert invoice data extraction assistant.
@@ -141,7 +184,7 @@ Return your answer using the exact JSON schema you were given — no extra
 commentary, no markdown formatting, just the structured data.
 """
 
-GEMMA_VISION_PROMPT_TEMPLATE = """You are looking at a photo/scan of an invoice page.
+VISION_PROMPT_TEMPLATE = """You are looking at a photo/scan of an invoice page.
 Extract the same invoice fields as described in these rules:
 
 {rules}
@@ -153,8 +196,8 @@ image using the same rules above.
 
 
 # ─────────────────────────────────────────────────────────
-# USAGE TRACKING — now a plain local accumulator, NOT a shared global.
-# Every function below that talks to the AI returns its own usage dict;
+# USAGE TRACKING — plain local accumulator, NOT a shared global. Every
+# function below that talks to the AI returns its own usage dict;
 # callers add it into their own local total. Nothing here is shared
 # across threads, so concurrent files can never corrupt each other's
 # token/cost numbers.
@@ -166,7 +209,7 @@ def _new_usage() -> Dict[str, Any]:
 
 
 def _add_usage(total: Dict[str, Any], addition: Optional[Dict[str, Any]]) -> None:
-    """Adds one call's usage into a running total (both are plain local dicts)."""
+    """Adds one call's usage into a running total (both plain local dicts)."""
     if not addition:
         return
     total["input_tokens"] += addition.get("input_tokens", 0)
@@ -175,25 +218,32 @@ def _add_usage(total: Dict[str, Any], addition: Optional[Dict[str, Any]]) -> Non
     total["calls"] += addition.get("calls", 0)
 
 
-def _usage_from_metadata(usage_metadata, model: str) -> Dict[str, Any]:
-    """
-    Turns one API response's usage_metadata into a plain usage dict for
-    THIS call only. Does not touch any shared/global state.
-    """
+def _usage_from_gemini(usage_metadata, model: str) -> Dict[str, Any]:
+    """Turns one Gemini response's usage_metadata into a plain usage dict."""
     if usage_metadata is None:
         return _new_usage()
     input_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
     output_tokens = getattr(usage_metadata, "candidates_token_count", 0) or 0
     cost = config.calculate_cost(input_tokens, output_tokens, model=model)
-
     logger.debug(f"Call usage -> model={model}, input_tokens={input_tokens}, "
                  f"output_tokens={output_tokens}, cost=${cost:.6f}")
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost": cost, "calls": 1}
 
+
+def _usage_from_openai(usage_obj, model: str) -> Dict[str, Any]:
+    """Turns one OpenAI response's usage object into a plain usage dict."""
+    if usage_obj is None:
+        return _new_usage()
+    input_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
+    output_tokens = getattr(usage_obj, "completion_tokens", 0) or 0
+    cost = config.calculate_cost(input_tokens, output_tokens, model=model)
+    logger.debug(f"Call usage -> model={model}, input_tokens={input_tokens}, "
+                 f"output_tokens={output_tokens}, cost=${cost:.6f}")
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost": cost, "calls": 1}
 
 
 # ─────────────────────────────────────────────────────────
-# BUILD THE TEXT PROMPT FROM EXTRACTED DATA
+# BUILD THE TEXT PROMPT FROM EXTRACTED DATA (unchanged, provider-agnostic)
 # ─────────────────────────────────────────────────────────
 
 def format_data_for_llm(data: Dict[str, Any]) -> str:
@@ -227,19 +277,31 @@ def format_data_for_llm(data: Dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────
-# CALL THE AI (with rate limiting + safe retries)
+# IMAGE HELPERS — Gemini's SDK accepts PIL images directly; OpenAI's
+# chat.completions API wants a base64 data URL instead.
 # ─────────────────────────────────────────────────────────
 
-_RETRYABLE_STATUS_CODES = {429, 503}
+def _pil_to_data_url(image) -> str:
+    """Encodes a PIL image as a base64 PNG data URL for OpenAI's vision input."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
+# ─────────────────────────────────────────────────────────
+# RETRY DECISION — shared by both backends.
+# ─────────────────────────────────────────────────────────
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
 def _is_retryable_error(exc: Exception) -> bool:
     """
-    Decides if an error is worth retrying. 429 (too many requests) and 503
-    (server temporarily busy) are worth retrying — the problem usually
-    fixes itself after a short wait. Most other errors (like a bad
-    request) will fail the same way every time, so retrying just wastes
-    time.
+    Decides if an error is worth retrying. 429/500/502/503 and timeouts
+    are worth retrying — the problem usually fixes itself after a short
+    wait. Most other errors (like a malformed request) will fail the
+    same way every time, so retrying just wastes time.
     """
     message = str(exc).lower()
     if any(str(code) in message for code in _RETRYABLE_STATUS_CODES):
@@ -249,84 +311,12 @@ def _is_retryable_error(exc: Exception) -> bool:
     return False
 
 
-def call_api(
-    prompt: str,
-    model: str = None,
-    images: Optional[List] = None,
-    max_retries: int = 5,
-) -> Tuple[Optional[dict], Dict[str, Any]]:
-    """
-    Sends a prompt (and optional images, for Gemma vision calls) to the AI
-    and returns (parsed_json_dict, usage_dict).
-
-    usage_dict is THIS call's usage only (input_tokens, output_tokens,
-    cost, calls) — a plain local dict, not shared state. On failure it's
-    an empty usage dict (all zeros) via _new_usage().
-
-    Retries only on "temporary" errors (see _is_retryable_error), waiting
-    longer each time (capped so it never waits forever), with a small
-    random jitter added so many parallel workers don't all retry at the
-    exact same second.
-    """
-    model = model or config.MODEL_NAME
-    client = config.get_llm_client()
-
-    is_gemma_call = "gemma" in model.lower()
-    limiter = config.gemma_limiter if is_gemma_call else config.gemini_limiter
-
-    contents = [prompt] if not images else [prompt, *images]
-
-    last_exception = None
-    for attempt in range(1, max_retries + 1):
-        # Wait our turn under the rate limit before actually calling the API
-        limiter.acquire()
-
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config={
-                    "max_output_tokens": config.MAX_OUTPUT_TOKENS,
-                    "response_mime_type": "application/json",
-                    "response_schema": INVOICE_RESPONSE_SCHEMA,
-                },
-            )
-            usage = _usage_from_metadata(getattr(response, "usage_metadata", None), model)
-            parsed = parse_response(response.text)
-            return parsed, usage
-
-        except Exception as e:
-            last_exception = e
-            if not _is_retryable_error(e):
-                logger.error(f"Non-retryable error calling {model}: {e}")
-                break
-
-            if attempt >= max_retries:
-                logger.error(f"Giving up on {model} after {attempt} attempts: {e}")
-                break
-
-            wait_time = min(2 ** attempt, 60) + random.uniform(0, 1)
-            logger.warning(f"Retryable error from {model} (attempt {attempt}/{max_retries}): "
-                            f"{e} — waiting {wait_time:.1f}s before retry")
-            time.sleep(wait_time)
-
-            # After 3 failed attempts on the main model, switch to the
-            # smaller/cheaper fallback model for the remaining attempts.
-            if attempt == 3 and model == config.MODEL_NAME:
-                logger.info(f"Switching from {config.MODEL_NAME} to fallback model "
-                            f"{config.FALLBACK_MODEL} after repeated failures")
-                model = config.FALLBACK_MODEL
-
-    logger.error(f"call_api failed permanently: {last_exception}")
-    return None, _new_usage()
-
-
 def parse_response(response_text: str) -> Optional[dict]:
     """
-    Turns the AI's text answer into a real Python dict. Even though we use
-    structured output (which should already guarantee valid JSON), we keep
-    this safety-net regex extraction in case some junk text (like markdown
-    fences) sneaks in around the JSON.
+    Turns the AI's text answer into a real Python dict. Even with
+    structured output (which should already guarantee valid JSON), we
+    keep this safety-net regex extraction in case junk text (like
+    markdown fences) sneaks in around the JSON.
     """
     if not response_text:
         return None
@@ -345,7 +335,150 @@ def parse_response(response_text: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────
-# GEMMA VISION FALLBACK (multi-page aware)
+# PROVIDER BACKEND: GEMINI
+# ─────────────────────────────────────────────────────────
+
+def _call_gemini_backend(
+    prompt: str,
+    model: str,
+    images: Optional[List],
+    max_retries: int,
+) -> Tuple[Optional[dict], Dict[str, Any]]:
+    client = config.get_llm_client()
+    limiter = config.get_limiter(model)
+    contents = [prompt] if not images else [prompt, *images]
+
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        limiter.acquire()
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config={
+                    "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+                    "response_mime_type": "application/json",
+                    "response_schema": GEMINI_RESPONSE_SCHEMA,
+                },
+            )
+            usage = _usage_from_gemini(getattr(response, "usage_metadata", None), model)
+            parsed = parse_response(response.text)
+            return parsed, usage
+
+        except Exception as e:
+            last_exception = e
+            if not _is_retryable_error(e):
+                logger.error(f"Non-retryable error calling {model}: {e}")
+                break
+            if attempt >= max_retries:
+                logger.error(f"Giving up on {model} after {attempt} attempts: {e}")
+                break
+
+            wait_time = min(2 ** attempt, 60) + random.uniform(0, 1)
+            logger.warning(f"Retryable error from {model} (attempt {attempt}/{max_retries}): "
+                            f"{e} — waiting {wait_time:.1f}s before retry")
+            time.sleep(wait_time)
+
+            if attempt == 3 and model == config.PRIMARY_MODEL:
+                logger.info(f"Switching from {config.PRIMARY_MODEL} to fallback model "
+                            f"{config.FALLBACK_MODEL} after repeated failures")
+                model = config.FALLBACK_MODEL
+
+    logger.error(f"call_api (gemini) failed permanently: {last_exception}")
+    return None, _new_usage()
+
+
+# ─────────────────────────────────────────────────────────
+# PROVIDER BACKEND: OPENAI
+# ─────────────────────────────────────────────────────────
+
+def _call_openai_backend(
+    prompt: str,
+    model: str,
+    images: Optional[List],
+    max_retries: int,
+) -> Tuple[Optional[dict], Dict[str, Any]]:
+    client = config.get_llm_client()
+    limiter = config.get_limiter(model)
+
+    if images:
+        content = [{"type": "text", "text": prompt}]
+        for img in images:
+            content.append({"type": "image_url", "image_url": {"url": _pil_to_data_url(img)}})
+        messages = [{"role": "user", "content": content}]
+    else:
+        messages = [{"role": "user", "content": prompt}]
+
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        limiter.acquire()
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_completion_tokens=config.MAX_OUTPUT_TOKENS,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "invoice_extraction",
+                        "strict": True,
+                        "schema": OPENAI_RESPONSE_SCHEMA,
+                    },
+                },
+            )
+            usage = _usage_from_openai(getattr(response, "usage", None), model)
+            parsed = parse_response(response.choices[0].message.content)
+            return parsed, usage
+
+        except Exception as e:
+            last_exception = e
+            if not _is_retryable_error(e):
+                logger.error(f"Non-retryable error calling {model}: {e}")
+                break
+            if attempt >= max_retries:
+                logger.error(f"Giving up on {model} after {attempt} attempts: {e}")
+                break
+
+            wait_time = min(2 ** attempt, 60) + random.uniform(0, 1)
+            logger.warning(f"Retryable error from {model} (attempt {attempt}/{max_retries}): "
+                            f"{e} — waiting {wait_time:.1f}s before retry")
+            time.sleep(wait_time)
+
+            if attempt == 3 and model == config.PRIMARY_MODEL:
+                logger.info(f"Switching from {config.PRIMARY_MODEL} to fallback model "
+                            f"{config.FALLBACK_MODEL} after repeated failures")
+                model = config.FALLBACK_MODEL
+
+    logger.error(f"call_api (openai) failed permanently: {last_exception}")
+    return None, _new_usage()
+
+
+# ─────────────────────────────────────────────────────────
+# DISPATCHER — the ONLY place that knows which provider is active.
+# Everything else in this file (and every OTHER file in the project)
+# just calls call_api() the same way regardless of provider.
+# ─────────────────────────────────────────────────────────
+
+def call_api(
+    prompt: str,
+    model: str = None,
+    images: Optional[List] = None,
+    max_retries: int = 5,
+) -> Tuple[Optional[dict], Dict[str, Any]]:
+    """
+    Sends a prompt (and optional images) to whichever LLM provider is
+    active (config.LLM_PROVIDER) and returns (parsed_json_dict, usage_dict).
+    usage_dict is THIS call's usage only — a plain local dict, safe to
+    use from any number of worker threads at once.
+    """
+    model = model or config.PRIMARY_MODEL
+    if config.LLM_PROVIDER == "openai":
+        return _call_openai_backend(prompt, model, images, max_retries)
+    return _call_gemini_backend(prompt, model, images, max_retries)
+
+
+# ─────────────────────────────────────────────────────────
+# VISION FALLBACK (multi-page aware, provider-agnostic)
 # ─────────────────────────────────────────────────────────
 
 def _find_null_fields(invoices: List[dict]) -> bool:
@@ -366,14 +499,15 @@ def _find_null_fields(invoices: List[dict]) -> bool:
 
 def _merge_only_nulls(original: List[dict], fallback: List[dict]) -> List[dict]:
     """
-    Combines the original (Gemini) result with the fallback (Gemma) result.
-    Matches invoices/items by their POSITION in the list (1st with 1st,
-    2nd with 2nd, etc). For each field, ONLY fills it in if the original
-    was null — never overwrites a value Gemini already got right.
+    Combines the original result with the vision-fallback result.
+    Matches invoices/items by POSITION in the list. For each field, ONLY
+    fills it in if the original was null — never overwrites a value the
+    primary pass already got right.
     """
     for i, orig_inv in enumerate(original):
         if i >= len(fallback):
-            logger.warning("Gemma returned fewer invoices than Gemini — skipping extras.")
+            logger.warning("Vision fallback returned fewer invoices than the primary pass — "
+                            "skipping extras.")
             break
         fb_inv = fallback[i]
 
@@ -386,8 +520,8 @@ def _merge_only_nulls(original: List[dict], fallback: List[dict]) -> List[dict]:
         orig_items = orig_inv.get("Invoice Items", [])
         fb_items = fb_inv.get("Invoice Items", [])
         if len(fb_items) < len(orig_items):
-            logger.warning("⚠️ Gemma returned fewer items than Gemini for this invoice — "
-                            "extras will keep their original (possibly null) values.")
+            logger.warning("⚠️ Vision fallback returned fewer items than the primary pass for "
+                            "this invoice — extras will keep their original (possibly null) values.")
 
         for j, orig_item in enumerate(orig_items):
             if j >= len(fb_items):
@@ -395,7 +529,6 @@ def _merge_only_nulls(original: List[dict], fallback: List[dict]) -> List[dict]:
             fb_item = fb_items[j]
             for key, value in fb_item.items():
                 if orig_item.get(key) is None and value is not None:
-                    # Re-validate anything we're about to fill in for hsn_sac/item_code
                     if key == "hsn_sac" and not RuleEngine.validate_hsn(value):
                         continue
                     if key == "item_code" and not RuleEngine.validate_item_code(value):
@@ -405,22 +538,23 @@ def _merge_only_nulls(original: List[dict], fallback: List[dict]) -> List[dict]:
     return original
 
 
-def apply_gemma_vision_fallback(
+def apply_vision_fallback(
     invoices: List[dict],
     data: Dict[str, Any],
     pdf_path: Optional[str],
 ) -> Tuple[List[dict], Dict[str, Any]]:
     """
     If any field is still null after the text-based pass + rule checks,
-    try showing the AI an actual PICTURE of the invoice page(s) instead
-    of just text — sometimes a field is visually there but was missed or
-    garbled during text/OCR extraction.
+    show the AI an actual PICTURE of the invoice page(s) — sometimes a
+    field is visually there but was missed or garbled during text/OCR
+    extraction. Uses config.VISION_MODEL, which is Gemma or GPT-4o(-mini)
+    depending on config.LLM_PROVIDER.
 
     MULTI-PAGE: tries page images one at a time (in order) until either
-    every field is filled in, or we run out of pages to try.
+    every field is filled in, or pages run out.
 
-    Returns (invoices, usage) — usage is a LOCAL accumulator covering only
-    the Gemma calls made in this function call, for this one file.
+    Returns (invoices, usage) — usage covers only the vision calls made
+    in this function call, for this one file.
     """
     usage = _new_usage()
 
@@ -431,27 +565,27 @@ def apply_gemma_vision_fallback(
     if images is None:
         if not pdf_path:
             logger.warning("No page images available and no pdf_path given — "
-                            "skipping Gemma vision fallback.")
+                            "skipping vision fallback.")
             return invoices, usage
         images = render_page_images(pdf_path)  # digital PDFs: render on demand
 
     if not images:
-        logger.warning("No page images could be produced — skipping Gemma vision fallback.")
+        logger.warning("No page images could be produced — skipping vision fallback.")
         return invoices, usage
 
-    rules_text = SYSTEM_PROMPT
-    prompt = GEMMA_VISION_PROMPT_TEMPLATE.format(rules=rules_text)
+    prompt = VISION_PROMPT_TEMPLATE.format(rules=SYSTEM_PROMPT)
 
     for page_index, page_image in enumerate(images, start=1):
         if not _find_null_fields(invoices):
             break  # already fixed everything, no need to check more pages
 
-        logger.info(f"Gemma vision fallback: trying page {page_index} of {len(images)}")
-        result, call_usage = call_api(prompt, model=config.GEMMA_VISION_MODEL, images=[page_image])
+        logger.info(f"Vision fallback ({config.LLM_PROVIDER}/{config.VISION_MODEL}): "
+                    f"trying page {page_index} of {len(images)}")
+        result, call_usage = call_api(prompt, model=config.VISION_MODEL, images=[page_image])
         _add_usage(usage, call_usage)
 
         if not result or "invoices" not in result:
-            logger.warning(f"Gemma returned no usable result for page {page_index}")
+            logger.warning(f"Vision fallback returned no usable result for page {page_index}")
             continue
 
         invoices = _merge_only_nulls(invoices, result["invoices"])
@@ -460,7 +594,7 @@ def apply_gemma_vision_fallback(
 
 
 # ─────────────────────────────────────────────────────────
-# MAIN ENTRY POINT — used by run.py and test_from_raw_json.py
+# MAIN ENTRY POINT — used by run.py and test scripts
 # ─────────────────────────────────────────────────────────
 
 def get_invoice_json_from_data(
@@ -470,44 +604,39 @@ def get_invoice_json_from_data(
     """
     Full pipeline for ONE file's extracted data:
       1. Build the text prompt from tables/texts.
-      2. Call Gemini to get structured JSON.
-      3. Run RuleEngine checks (including the new document-level HSN rule).
-      4. If anything is still missing, fall back to Gemma vision (image-based),
+      2. Call the active provider's primary model to get structured JSON.
+      3. Run RuleEngine checks (including the document-level HSN rule).
+      4. If anything is still missing, fall back to vision (image-based),
          trying multiple pages if needed.
       5. Return the final, validated result.
 
     Returns (result, usage) — usage is a LOCAL accumulator for just this
-    one call to this function (this one file), covering every AI call
-    made along the way (Gemini + any Gemma fallback calls). Safe to call
-    from multiple threads at once: nothing here is shared global state.
+    one call (this one file), covering every AI call made along the way.
+    Safe to call from multiple threads at once: nothing here is shared
+    global state, and it works identically whether config.LLM_PROVIDER
+    is "gemini" or "openai".
     """
     usage = _new_usage()
 
     prompt = f"{SYSTEM_PROMPT}\n\n=== INVOICE DATA ===\n{format_data_for_llm(data)}"
 
-    result, call_usage = call_api(prompt, model=config.MODEL_NAME)
+    result, call_usage = call_api(prompt, model=config.PRIMARY_MODEL)
     _add_usage(usage, call_usage)
 
     if not result or "invoices" not in result:
-        logger.error("Primary Gemini extraction failed or returned no invoices.")
+        logger.error("Primary extraction failed or returned no invoices.")
         return {"invoices": []}, usage
 
     invoices = result["invoices"]
 
-    # Rule checks — includes the free, safe document-level HSN rule, which
-    # runs BEFORE the costly Gemma vision fallback below.
     invoices = RuleEngine.apply_post_llm_rules(invoices, texts=data.get("texts"))
 
-    # Only spend on Gemma vision if something is still missing after all that.
-    invoices, fallback_usage = apply_gemma_vision_fallback(invoices, data, pdf_path)
+    invoices, fallback_usage = apply_vision_fallback(invoices, data, pdf_path)
     _add_usage(usage, fallback_usage)
 
-    # One more pass of the rule checks, in case Gemma filled in a field
-    # that also needed the same validation (e.g. it found a new hsn_sac
-    # that still needs format-checking).
     invoices = RuleEngine.apply_post_llm_rules(invoices, texts=data.get("texts"))
 
-    logger.info(f"Finished extraction: {len(invoices)} invoice(s), "
+    logger.info(f"Finished extraction ({config.LLM_PROVIDER}): {len(invoices)} invoice(s), "
                 f"{usage['calls']} AI call(s), cost for this file ${usage['cost']:.6f}")
 
     return {"invoices": invoices}, usage

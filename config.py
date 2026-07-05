@@ -1,25 +1,26 @@
 """
 config.py – Central settings file for the invoice pipeline.
 
-WHAT'S NEW (in simple words):
-  1. LOGGING: instead of using print(), every file will now write proper
-     log messages (to a file AND to the screen). This helps you find
-     problems later, especially in a big batch run.
-  2. DEVICE (CPU or GPU): the program checks your computer automatically
-     and decides whether to use CPU or GPU. You can also force it by
-     writing DEVICE=cpu or DEVICE=gpu in your .env file.
-     - If you write DEVICE=gpu but your computer has NO gpu, the program
-       will STOP and show a clear error (instead of quietly running slow
-       on CPU without telling you).
-  3. DEVICE PROFILES: once we know CPU or GPU, we automatically pick good
-     default settings (like how many workers, how many pages at once).
-     You don't have to remember these numbers yourself.
-  4. RATE LIMITER: makes sure we don't send too many requests per minute
-     to Gemini/Gemma (which would get blocked by Google).
-  5. REAL COST CALCULATION: calculates actual cost per file instead of
-     always showing 0.
-  6. MODEL CHECK AT STARTUP: tests that your model names are valid BEFORE
-     you start processing thousands of files.
+PROVIDER ABSTRACTION (NEW):
+  This file now supports TWO LLM providers — Google Gemini and OpenAI —
+  switchable with ONE setting: LLM_PROVIDER in your .env file.
+    LLM_PROVIDER=gemini   -> uses Gemini (primary) + Gemma (vision fallback)
+    LLM_PROVIDER=openai   -> uses GPT-4o family for both primary + vision
+
+  Everything else in the pipeline (llm_extractor.py, run.py, rule_engine.py)
+  talks to THREE generic names instead of provider-specific ones:
+    config.PRIMARY_MODEL   - the main text-extraction model
+    config.FALLBACK_MODEL  - used after repeated primary-model failures
+    config.VISION_MODEL    - used for the page-image fallback pass
+  These automatically point at the right model names for whichever
+  provider is active, so switching providers never requires touching
+  llm_extractor.py.
+
+  Only the API key for the ACTIVE provider is required at startup — if
+  you're running LLM_PROVIDER=gemini locally, you do NOT need an
+  OPENAI_API_KEY set, and vice versa in production. This is the whole
+  point: you can develop against Gemini locally and deploy against
+  OpenAI in prod by changing ONE line in .env, no code changes.
 """
 
 import os
@@ -33,9 +34,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────
-# STEP 1: LOGGING SETUP
-# This replaces every print() in the project. Logs go to both the
-# screen (so you can watch it live) and a file (so you can check later).
+# STEP 1: LOGGING SETUP (unchanged)
 # ─────────────────────────────────────────────────────────
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -57,8 +56,6 @@ def setup_logging() -> logging.Logger:
 
     log_format = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    # Writes logs to a file, and automatically starts a new file after 50MB
-    # (keeps old files too, up to 10 of them, so disk doesn't fill up forever)
     file_handler = RotatingFileHandler(
         os.path.join(LOG_DIR, "pipeline.log"),
         maxBytes=50 * 1024 * 1024,
@@ -67,7 +64,6 @@ def setup_logging() -> logging.Logger:
     )
     file_handler.setFormatter(log_format)
 
-    # Also prints logs to your terminal screen
     screen_handler = logging.StreamHandler()
     screen_handler.setFormatter(log_format)
 
@@ -82,9 +78,9 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 2: DEVICE DETECTION (CPU or GPU)
-# Rule: if DEVICE is written clearly in .env, always trust that.
-# If not written (or written as "auto"), check the computer automatically.
+# STEP 2: DEVICE DETECTION (CPU or GPU) — unchanged.
+# This is about OCR hardware, completely separate from which LLM
+# provider you use for text extraction.
 # ─────────────────────────────────────────────────────────
 
 def _gpu_is_available() -> bool:
@@ -103,9 +99,6 @@ def _resolve_device() -> str:
     requested = os.getenv("DEVICE", "auto").strip().lower()
 
     if requested == "gpu":
-        # User explicitly asked for GPU. If none is found, STOP with an
-        # error instead of quietly switching to CPU. This protects you
-        # from accidentally running a huge batch on CPU by mistake.
         if not _gpu_is_available():
             raise RuntimeError(
                 "DEVICE=gpu was set in .env, but no GPU was found on this machine. "
@@ -117,11 +110,9 @@ def _resolve_device() -> str:
         return "gpu"
 
     if requested == "cpu":
-        # User explicitly asked for CPU. Always honored, no checks needed.
         logger.info("Device resolved to: cpu (explicitly set in .env)")
         return "cpu"
 
-    # requested == "auto" (or anything unrecognized) -> auto-detect quietly
     if _gpu_is_available():
         logger.info("Device resolved to: gpu (auto-detected)")
         return "gpu"
@@ -134,12 +125,7 @@ DEVICE = _resolve_device()
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 3: DEVICE PROFILES
-# These are the "good default settings" for each device type.
-# Example: on CPU, we use only 1 OCR worker (because CPU has limited
-# power and running many at once just slows everything down).
-# On GPU, we can use more workers and bigger batches because GPUs are
-# built to handle many things at once.
+# STEP 3: DEVICE PROFILES (OCR settings) — unchanged
 # ─────────────────────────────────────────────────────────
 
 DEVICE_PROFILES = {
@@ -161,15 +147,8 @@ _profile = DEVICE_PROFILES[DEVICE]
 
 
 def _setting(env_name: str, profile_key: str, cast=int):
-    """
-    Picks the final value for a setting.
-    Rule: if you personally wrote it in .env, use that.
-    Otherwise, use the automatic profile default for your device.
-
-    Example: if DEVICE=cpu and you didn't set MAX_WORKERS in .env,
-    this returns 4 (the CPU default). But if you DID write
-    MAX_WORKERS=6 in .env, it returns 6 instead — your choice always wins.
-    """
+    """If you wrote it in .env, that wins. Otherwise use the device's
+    profile default."""
     raw_value = os.getenv(env_name)
     if raw_value is not None:
         return cast(raw_value)
@@ -188,55 +167,113 @@ logger.info(
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 4: OTHER SETTINGS (models, folders, keys)
+# STEP 4: OTHER SETTINGS (folders, item-code range) — unchanged
 # ─────────────────────────────────────────────────────────
 
 ITEM_CODE_MIN = 1000000
 ITEM_CODE_MAX = 4999999
 
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash-lite")
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "16000"))
 INPUT_DIR = os.getenv("INPUT_DIR", "./input")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./Output_Folder")
 DB_PATH = os.getenv("DB_PATH", "./run_status.db")
 
-#GEMMA_VISION_MODEL = os.getenv("GEMMA_VISION_MODEL", "gemma-4-26b-a4b-it")
+
+# ─────────────────────────────────────────────────────────
+# STEP 5: LLM PROVIDER SWITCH (NEW)
+# This ONE setting decides everything below it: which SDK gets used,
+# which API key is required, which models get called, which rate
+# limiter applies.
+# ─────────────────────────────────────────────────────────
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+if LLM_PROVIDER not in ("gemini", "openai"):
+    raise ValueError(
+        f"LLM_PROVIDER must be 'gemini' or 'openai', got '{LLM_PROVIDER}'. "
+        f"Set it in your .env file."
+    )
+
+# --- Gemini-specific settings (only enforced if LLM_PROVIDER=gemini) ---
+GEMINI_MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash-lite")
 GEMMA_VISION_MODEL = os.getenv("GEMMA_VISION_MODEL", "gemma-4-31b-it")
-
-GEMINI_RPM_LIMIT = int(os.getenv("GEMINI_RPM_LIMIT", "60"))  # RPM = requests per minute
+GEMINI_RPM_LIMIT = int(os.getenv("GEMINI_RPM_LIMIT", "60"))
 GEMMA_RPM_LIMIT = int(os.getenv("GEMMA_RPM_LIMIT", "30"))
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set in .env")
+
+# --- OpenAI-specific settings (only enforced if LLM_PROVIDER=openai) ---
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+# GPT-4o and GPT-4o-mini both read images natively — default the vision
+# fallback to the SAME model unless you deliberately want a stronger
+# model just for that harder image-reading pass.
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", OPENAI_MODEL_NAME)
+OPENAI_RPM_LIMIT = int(os.getenv("OPENAI_RPM_LIMIT", "500"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# --- Only require the API key for whichever provider is ACTUALLY
+# active. This is the whole point of the switch. ---
+if LLM_PROVIDER == "gemini" and not GEMINI_API_KEY:
+    raise ValueError("LLM_PROVIDER=gemini but GEMINI_API_KEY is not set in .env")
+if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
+    raise ValueError("LLM_PROVIDER=openai but OPENAI_API_KEY is not set in .env")
+
+# --- Generic names the REST of the pipeline (llm_extractor.py, run.py)
+# actually uses. Adding a third provider later means adding one more
+# branch here — nowhere else in the codebase needs to change. ---
+if LLM_PROVIDER == "gemini":
+    PRIMARY_MODEL = GEMINI_MODEL_NAME
+    FALLBACK_MODEL = GEMINI_FALLBACK_MODEL
+    VISION_MODEL = GEMMA_VISION_MODEL
+else:  # openai
+    PRIMARY_MODEL = OPENAI_MODEL_NAME
+    FALLBACK_MODEL = OPENAI_FALLBACK_MODEL
+    VISION_MODEL = OPENAI_VISION_MODEL
+
+logger.info(f"LLM provider: {LLM_PROVIDER} | primary={PRIMARY_MODEL} | "
+            f"fallback={FALLBACK_MODEL} | vision={VISION_MODEL}")
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 5: GEMINI CLIENT (the connection to Google's AI)
+# STEP 6: LLM CLIENTS — one singleton per provider, created lazily so we
+# never import or initialize an SDK you're not actually using (e.g. a
+# Gemini-only run never touches the openai package at all).
 # ─────────────────────────────────────────────────────────
 
 _gemini_client = None
-_client_lock = threading.Lock()  # prevents two workers from creating 2 clients at once
+_openai_client = None
+_client_lock = threading.Lock()  # shared lock, protects whichever client is being created
 
 
 def get_llm_client():
-    """Returns one shared connection to Gemini (created only once)."""
-    global _gemini_client
-    if _gemini_client is None:
-        with _client_lock:
-            if _gemini_client is None:
-                from google import genai
-                _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-                logger.info(f"Gemini client ready (model: {MODEL_NAME}, gemma vision: {GEMMA_VISION_MODEL})")
-    return _gemini_client
+    """Returns the client for whichever provider is active (created once,
+    reused for every call after that)."""
+    global _gemini_client, _openai_client
+
+    if LLM_PROVIDER == "gemini":
+        if _gemini_client is None:
+            with _client_lock:
+                if _gemini_client is None:
+                    from google import genai
+                    _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+                    logger.info(f"Gemini client ready (model: {GEMINI_MODEL_NAME}, "
+                                f"vision: {GEMMA_VISION_MODEL})")
+        return _gemini_client
+
+    else:  # openai
+        if _openai_client is None:
+            with _client_lock:
+                if _openai_client is None:
+                    from openai import OpenAI
+                    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+                    logger.info(f"OpenAI client ready (model: {OPENAI_MODEL_NAME}, "
+                                f"vision: {OPENAI_VISION_MODEL})")
+        return _openai_client
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 6: RATE LIMITER
-# This stops us from sending too many requests per minute to Google.
-# Think of it like a bucket that can only hold N tokens per minute —
-# if it's full, new requests wait their turn instead of crashing.
+# STEP 7: RATE LIMITER — same TokenBucketLimiter class for both
+# providers, just different instances/limits depending on which is active.
 # ─────────────────────────────────────────────────────────
 
 class TokenBucketLimiter:
@@ -249,19 +286,18 @@ class TokenBucketLimiter:
         self._lock = threading.Lock()
 
     def acquire(self):
-        """Call this right before making an API request. It may pause
-        (sleep) for a moment if we're going too fast."""
+        """Call this right before making an API request. May pause for a
+        moment if we're going too fast."""
         while True:
             with self._lock:
                 now = time.monotonic()
                 one_minute_ago = now - 60.0
-                # forget calls older than 1 minute
                 while self._recent_calls and self._recent_calls[0] < one_minute_ago:
                     self._recent_calls.popleft()
 
                 if len(self._recent_calls) < self.rpm_limit:
                     self._recent_calls.append(now)
-                    return  # allowed to go now
+                    return
 
                 wait_time = max(0.05, 60.0 - (now - self._recent_calls[0]))
 
@@ -269,29 +305,50 @@ class TokenBucketLimiter:
             time.sleep(wait_time)
 
 
+# Gemini has separate limits for the main model vs. the Gemma vision model.
 gemini_limiter = TokenBucketLimiter(GEMINI_RPM_LIMIT, name="gemini")
 gemma_limiter = TokenBucketLimiter(GEMMA_RPM_LIMIT, name="gemma")
 
+# OpenAI: one account-level limit covers both the primary and vision
+# calls (same account/tier either way), so a single shared limiter.
+openai_limiter = TokenBucketLimiter(OPENAI_RPM_LIMIT, name="openai")
+
+
+def get_limiter(model: str) -> TokenBucketLimiter:
+    """
+    Picks the right rate limiter for a given model name + active
+    provider. llm_extractor.py calls this instead of needing to know
+    provider details itself.
+    """
+    if LLM_PROVIDER == "gemini":
+        return gemma_limiter if "gemma" in model.lower() else gemini_limiter
+    return openai_limiter
+
 
 # ─────────────────────────────────────────────────────────
-# STEP 7: COST CALCULATION
-# Works out the real dollar cost for each API call, based on how many
-# tokens (roughly: words/pieces of text) were used.
-# IMPORTANT: check Google's actual pricing page and update the numbers
-# below before trusting the total cost on a big run.
+# STEP 8: COST CALCULATION — pricing tables for BOTH providers. Only the
+# active provider's models actually get used, but keeping both here
+# means switching providers never requires touching this table.
+# IMPORTANT: verify these against the provider's current pricing page
+# before trusting totals on a real production run — prices change.
 # ─────────────────────────────────────────────────────────
 
 PRICING_PER_MILLION_TOKENS = {
+    # Gemini
     "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
-    "gemma-4-26b-a4b-it": {"input": 0.0, "output": 0.0},  # confirm with your plan
-    "gemma-4-31b-it": {"input": 0.0, "output": 0.0},      # confirm with your plan
+    "gemma-4-26b-a4b-it": {"input": 0.0, "output": 0.0},   # confirm with your plan
+    "gemma-4-31b-it": {"input": 0.0, "output": 0.0},       # confirm with your plan
+    # OpenAI — verify against platform.openai.com/pricing before trusting
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
 }
 
 
 def calculate_cost(input_tokens: int, output_tokens: int, model: str = None) -> float:
-    """Returns the cost in dollars for one API call."""
-    model = model or MODEL_NAME
+    """Returns the cost in dollars for one API call, whichever provider it was."""
+    model = model or PRIMARY_MODEL
     prices = PRICING_PER_MILLION_TOKENS.get(model)
     if prices is None:
         logger.warning(f"No price listed for model '{model}' — showing cost as 0.0. "
@@ -302,26 +359,35 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = None) -> 
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 8: STARTUP MODEL CHECK
-# Before running thousands of files, test that the model names actually
-# work. Better to find out now than after 40,000 files.
+# STEP 9: STARTUP MODEL CHECK — pings only the ACTIVE provider's models.
+# Better to find out a model name is wrong now than after 10,000 files.
 # ─────────────────────────────────────────────────────────
 
 def validate_models() -> None:
-    """Sends one tiny test message to each model. Stops the program with
-    a clear error if any model name is wrong or unavailable."""
+    """Sends one tiny test message to each model the active provider will
+    use. Stops the program with a clear error if any model name is wrong
+    or unavailable."""
     client = get_llm_client()
-    for model in (MODEL_NAME, FALLBACK_MODEL, GEMMA_VISION_MODEL):
+    models_to_check = {PRIMARY_MODEL, FALLBACK_MODEL, VISION_MODEL}
+
+    for model in models_to_check:
         try:
-            client.models.generate_content(
-                model=model,
-                contents="ping",
-                config={"max_output_tokens": 5},
-            )
+            if LLM_PROVIDER == "gemini":
+                client.models.generate_content(
+                    model=model,
+                    contents="ping",
+                    config={"max_output_tokens": 5},
+                )
+            else:  # openai
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=5,
+                )
             logger.info(f"Model check OK: {model}")
         except Exception as e:
             raise RuntimeError(
-                f"Could not use model '{model}'. It may not be available on your "
-                f"API key/plan — check your Google AI Studio model list. "
+                f"Could not use model '{model}' (provider: {LLM_PROVIDER}). It may not be "
+                f"available on your API key/plan — check your account's model access. "
                 f"Original error: {e}"
             )
