@@ -26,6 +26,16 @@ WHAT'S NEW (in simple words):
   7. Tracks how many tokens (pieces of text) and how much money each file
      costs, using config.calculate_cost(), so you can see real spend.
 
+  FIXED (concurrency bug): usage/cost tracking used to live in ONE shared
+  module-level dict (_usage_totals), reset per file by run.py. Since
+  run.py processes many files at the SAME TIME with a thread pool, two
+  files finishing close together could reset/overwrite each other's
+  numbers — costs and token counts got attributed to the wrong file.
+  Usage is now returned directly from call_api() and accumulated in a
+  LOCAL variable inside get_invoice_json_from_data(), one per file, with
+  nothing shared between threads. get_invoice_json_from_data() now
+  returns (result, usage) instead of just result.
+
 WHAT "jitter" MEANS (simple explanation):
   If 20 files all get rate-limited at the exact same moment, and they all
   wait exactly "4 seconds" before retrying, they'll all hit the server
@@ -143,39 +153,43 @@ image using the same rules above.
 
 
 # ─────────────────────────────────────────────────────────
-# USAGE TRACKING — remembers how many tokens / how much cost was used.
-# run.py can read this after processing each file to save it into the
-# tracker database.
+# USAGE TRACKING — now a plain local accumulator, NOT a shared global.
+# Every function below that talks to the AI returns its own usage dict;
+# callers add it into their own local total. Nothing here is shared
+# across threads, so concurrent files can never corrupt each other's
+# token/cost numbers.
 # ─────────────────────────────────────────────────────────
 
-_usage_totals = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "calls": 0}
+def _new_usage() -> Dict[str, Any]:
+    """A fresh, empty usage accumulator. Call this once per file."""
+    return {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "calls": 0}
 
 
-def get_usage_totals() -> Dict[str, Any]:
-    """Returns a copy of the running totals so far (tokens, cost, call count)."""
-    return dict(_usage_totals)
-
-
-def reset_usage_totals() -> None:
-    """Call this before processing a new file, so totals reflect just that file."""
-    _usage_totals.update({"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "calls": 0})
-
-
-def _record_usage(usage_metadata, model: str) -> None:
-    """Reads token counts off the API response and adds them to our running totals."""
-    if usage_metadata is None:
+def _add_usage(total: Dict[str, Any], addition: Optional[Dict[str, Any]]) -> None:
+    """Adds one call's usage into a running total (both are plain local dicts)."""
+    if not addition:
         return
+    total["input_tokens"] += addition.get("input_tokens", 0)
+    total["output_tokens"] += addition.get("output_tokens", 0)
+    total["cost"] += addition.get("cost", 0.0)
+    total["calls"] += addition.get("calls", 0)
+
+
+def _usage_from_metadata(usage_metadata, model: str) -> Dict[str, Any]:
+    """
+    Turns one API response's usage_metadata into a plain usage dict for
+    THIS call only. Does not touch any shared/global state.
+    """
+    if usage_metadata is None:
+        return _new_usage()
     input_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
     output_tokens = getattr(usage_metadata, "candidates_token_count", 0) or 0
     cost = config.calculate_cost(input_tokens, output_tokens, model=model)
 
-    _usage_totals["input_tokens"] += input_tokens
-    _usage_totals["output_tokens"] += output_tokens
-    _usage_totals["cost"] += cost
-    _usage_totals["calls"] += 1
-
     logger.debug(f"Call usage -> model={model}, input_tokens={input_tokens}, "
                  f"output_tokens={output_tokens}, cost=${cost:.6f}")
+
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost": cost, "calls": 1}
 
 
 # ─────────────────────────────────────────────────────────
@@ -240,10 +254,14 @@ def call_api(
     model: str = None,
     images: Optional[List] = None,
     max_retries: int = 5,
-) -> Tuple[Optional[dict], Any]:
+) -> Tuple[Optional[dict], Dict[str, Any]]:
     """
     Sends a prompt (and optional images, for Gemma vision calls) to the AI
-    and returns (parsed_json_dict, usage_metadata).
+    and returns (parsed_json_dict, usage_dict).
+
+    usage_dict is THIS call's usage only (input_tokens, output_tokens,
+    cost, calls) — a plain local dict, not shared state. On failure it's
+    an empty usage dict (all zeros) via _new_usage().
 
     Retries only on "temporary" errors (see _is_retryable_error), waiting
     longer each time (capped so it never waits forever), with a small
@@ -273,9 +291,9 @@ def call_api(
                     "response_schema": INVOICE_RESPONSE_SCHEMA,
                 },
             )
-            _record_usage(getattr(response, "usage_metadata", None), model)
+            usage = _usage_from_metadata(getattr(response, "usage_metadata", None), model)
             parsed = parse_response(response.text)
-            return parsed, getattr(response, "usage_metadata", None)
+            return parsed, usage
 
         except Exception as e:
             last_exception = e
@@ -300,7 +318,7 @@ def call_api(
                 model = config.FALLBACK_MODEL
 
     logger.error(f"call_api failed permanently: {last_exception}")
-    return None, None
+    return None, _new_usage()
 
 
 def parse_response(response_text: str) -> Optional[dict]:
@@ -387,7 +405,11 @@ def _merge_only_nulls(original: List[dict], fallback: List[dict]) -> List[dict]:
     return original
 
 
-def apply_gemma_vision_fallback(invoices: List[dict], data: Dict[str, Any], pdf_path: Optional[str]) -> List[dict]:
+def apply_gemma_vision_fallback(
+    invoices: List[dict],
+    data: Dict[str, Any],
+    pdf_path: Optional[str],
+) -> Tuple[List[dict], Dict[str, Any]]:
     """
     If any field is still null after the text-based pass + rule checks,
     try showing the AI an actual PICTURE of the invoice page(s) instead
@@ -395,23 +417,27 @@ def apply_gemma_vision_fallback(invoices: List[dict], data: Dict[str, Any], pdf_
     garbled during text/OCR extraction.
 
     MULTI-PAGE: tries page images one at a time (in order) until either
-    every field is filled in, or we run out of pages to try. This
-    replaces the old behavior of only ever checking page 1.
+    every field is filled in, or we run out of pages to try.
+
+    Returns (invoices, usage) — usage is a LOCAL accumulator covering only
+    the Gemma calls made in this function call, for this one file.
     """
+    usage = _new_usage()
+
     if not _find_null_fields(invoices):
-        return invoices  # nothing missing — skip the extra AI call entirely
+        return invoices, usage  # nothing missing — skip the extra AI call entirely
 
     images = data.get("images")  # already-rendered pages, for scanned PDFs
     if images is None:
         if not pdf_path:
             logger.warning("No page images available and no pdf_path given — "
                             "skipping Gemma vision fallback.")
-            return invoices
+            return invoices, usage
         images = render_page_images(pdf_path)  # digital PDFs: render on demand
 
     if not images:
         logger.warning("No page images could be produced — skipping Gemma vision fallback.")
-        return invoices
+        return invoices, usage
 
     rules_text = SYSTEM_PROMPT
     prompt = GEMMA_VISION_PROMPT_TEMPLATE.format(rules=rules_text)
@@ -421,7 +447,8 @@ def apply_gemma_vision_fallback(invoices: List[dict], data: Dict[str, Any], pdf_
             break  # already fixed everything, no need to check more pages
 
         logger.info(f"Gemma vision fallback: trying page {page_index} of {len(images)}")
-        result, _usage = call_api(prompt, model=config.GEMMA_VISION_MODEL, images=[page_image])
+        result, call_usage = call_api(prompt, model=config.GEMMA_VISION_MODEL, images=[page_image])
+        _add_usage(usage, call_usage)
 
         if not result or "invoices" not in result:
             logger.warning(f"Gemma returned no usable result for page {page_index}")
@@ -429,14 +456,17 @@ def apply_gemma_vision_fallback(invoices: List[dict], data: Dict[str, Any], pdf_
 
         invoices = _merge_only_nulls(invoices, result["invoices"])
 
-    return invoices
+    return invoices, usage
 
 
 # ─────────────────────────────────────────────────────────
 # MAIN ENTRY POINT — used by run.py and test_from_raw_json.py
 # ─────────────────────────────────────────────────────────
 
-def get_invoice_json_from_data(data: Dict[str, Any], pdf_path: Optional[str] = None) -> dict:
+def get_invoice_json_from_data(
+    data: Dict[str, Any],
+    pdf_path: Optional[str] = None,
+) -> Tuple[dict, Dict[str, Any]]:
     """
     Full pipeline for ONE file's extracted data:
       1. Build the text prompt from tables/texts.
@@ -446,16 +476,21 @@ def get_invoice_json_from_data(data: Dict[str, Any], pdf_path: Optional[str] = N
          trying multiple pages if needed.
       5. Return the final, validated result.
 
-    Call get_usage_totals() after this function to see tokens/cost used
-    for this file (call reset_usage_totals() first if you want totals
-    per-file instead of cumulative across the whole run).
+    Returns (result, usage) — usage is a LOCAL accumulator for just this
+    one call to this function (this one file), covering every AI call
+    made along the way (Gemini + any Gemma fallback calls). Safe to call
+    from multiple threads at once: nothing here is shared global state.
     """
+    usage = _new_usage()
+
     prompt = f"{SYSTEM_PROMPT}\n\n=== INVOICE DATA ===\n{format_data_for_llm(data)}"
 
-    result, _usage = call_api(prompt, model=config.MODEL_NAME)
+    result, call_usage = call_api(prompt, model=config.MODEL_NAME)
+    _add_usage(usage, call_usage)
+
     if not result or "invoices" not in result:
         logger.error("Primary Gemini extraction failed or returned no invoices.")
-        return {"invoices": []}
+        return {"invoices": []}, usage
 
     invoices = result["invoices"]
 
@@ -464,15 +499,15 @@ def get_invoice_json_from_data(data: Dict[str, Any], pdf_path: Optional[str] = N
     invoices = RuleEngine.apply_post_llm_rules(invoices, texts=data.get("texts"))
 
     # Only spend on Gemma vision if something is still missing after all that.
-    invoices = apply_gemma_vision_fallback(invoices, data, pdf_path)
+    invoices, fallback_usage = apply_gemma_vision_fallback(invoices, data, pdf_path)
+    _add_usage(usage, fallback_usage)
 
     # One more pass of the rule checks, in case Gemma filled in a field
     # that also needed the same validation (e.g. it found a new hsn_sac
     # that still needs format-checking).
     invoices = RuleEngine.apply_post_llm_rules(invoices, texts=data.get("texts"))
 
-    usage = get_usage_totals()
     logger.info(f"Finished extraction: {len(invoices)} invoice(s), "
-                f"{usage['calls']} AI call(s), cost so far ${usage['cost']:.6f}")
+                f"{usage['calls']} AI call(s), cost for this file ${usage['cost']:.6f}")
 
-    return {"invoices": invoices}
+    return {"invoices": invoices}, usage

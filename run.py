@@ -7,19 +7,37 @@ WHAT'S NEW (in simple words):
      remembers which files are already done. If the program crashes or
      you stop it halfway through 100,000 files, running it again will
      SKIP the files already finished, instead of starting over from zero.
-  3. WORKER POOL: processes multiple files AT THE SAME TIME (instead of
-     one by one), using config.MAX_WORKERS. This makes big batches much
-     faster, since most of the waiting time is just waiting for the AI's
-     reply — while one file waits, another file can be working.
+  3. WORKER POOL: processes multiple DIGITAL files AT THE SAME TIME
+     (using config.MAX_WORKERS), since that work is CPU/network-bound,
+     not GPU-bound.
   4. STARTUP CHECK: tests your AI model names before starting the batch,
      so a typo in a model name fails immediately instead of after
      thousands of files.
-  5. NEW COMMAND OPTIONS:
+  5. COMMAND OPTIONS:
        --workers N     how many files to process at the same time
        --resume        skip files already completed (this is the default)
        --force         reprocess EVERY file, even ones already completed
        --limit N       only process the first N files (good for testing)
   6. Tracks tokens used and cost spent per file, saved into the database.
+
+  FIXED (2 changes from before):
+
+  A) Usage/cost tracking no longer depends on a shared global in
+     llm_extractor.py. get_invoice_json_from_data() now RETURNS
+     (result, usage) directly, and we use that returned usage right here
+     — safe with any number of worker threads.
+
+  B) SCANNED (OCR) PDFs are no longer processed one-thread-per-file. All
+     scanned/mixed PDFs found in this run are first grouped by total page
+     count (create_pdf_aware_batches), then OCR'd in ONE call per group
+     (extract_scanned_batch) — so the GPU only ever does one big, orderly
+     batch of OCR work at a time, instead of several threads separately
+     calling the OCR model and fighting over the same GPU. The (network-
+     bound) Gemini/Gemma calls for the files in that batch still run
+     concurrently afterward, since that part isn't GPU work at all.
+
+     Digital PDFs are unaffected by this — they never touch the GPU, so
+     they keep using the same "one thread per file" flow as before.
 """
 
 import sys
@@ -31,13 +49,14 @@ import argparse
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
 from detector import detect_pdf_type
 from digital_extractor import extract_digital_clean
-from scanned_extractor import extract_scanned_clean
-from llm_extractor import get_invoice_json_from_data, get_usage_totals, reset_usage_totals
+from scanned_extractor import extract_scanned_batch, create_pdf_aware_batches
+from llm_extractor import get_invoice_json_from_data
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +146,7 @@ def _mark_finished(doc_id: str, status: str, error: str = None,
 
 def print_summary() -> None:
     """Shows an overview of the whole batch: how many succeeded, failed,
-    total tokens used, total cost so far. Simple version of what a
-    separate tracker.py would have done."""
+    total tokens used, total cost so far."""
     conn = _get_db_connection()
     try:
         rows = conn.execute("""
@@ -171,37 +189,40 @@ def collect_pdfs(root_dir: str):
     return sorted(pdfs)
 
 
+def classify_pdfs(pdfs: List[Path]) -> Tuple[List[Path], List[Path]]:
+    """
+    Runs detection ONCE per file up front, so we know before doing any
+    heavier work which files need the digital path vs. the OCR-batch
+    path. "mixed" PDFs are treated as scanned (they still need OCR for
+    at least part of the document).
+    """
+    digital, scanned = [], []
+    for pdf in pdfs:
+        try:
+            overall, _ = detect_pdf_type(str(pdf))
+        except Exception as e:
+            logger.error(f"{pdf.name}: detection failed: {e}")
+            _mark_started(pdf.stem, pdf.name)
+            _mark_finished(pdf.stem, "failed", error=f"detection failed: {e}")
+            continue
+
+        logger.info(f"{pdf.name}: detected as {overall}")
+        if overall == "digital":
+            digital.append(pdf)
+        else:
+            scanned.append(pdf)  # "scanned" or "mixed"
+
+    return digital, scanned
+
+
 # ─────────────────────────────────────────────────────────
-# PROCESS ONE FILE (same logic as before, now with tracking + logging)
+# SHARED FINAL STEPS — used by BOTH the digital path and the scanned
+# path, once a file's raw {"tables":..., "texts":...} data is in hand.
 # ─────────────────────────────────────────────────────────
 
-def process_pdf(pdf_path: Path) -> bool:
+def _process_extracted(pdf_path: Path, data: dict) -> bool:
     fname = pdf_path.name
     doc_id = pdf_path.stem
-    logger.info(f"Processing: {fname}")
-
-    _mark_started(doc_id, fname)
-    reset_usage_totals()  # so tokens/cost recorded below are just for THIS file
-
-    # 1. Detect type
-    try:
-        overall, _ = detect_pdf_type(str(pdf_path))
-        logger.info(f"{fname}: detected as {overall}")
-    except Exception as e:
-        logger.error(f"{fname}: detection failed: {e}")
-        _mark_finished(doc_id, "failed", error=f"detection failed: {e}")
-        return False
-
-    # 2. Extract (dict schema, same for both paths)
-    try:
-        if overall == "digital":
-            data = extract_digital_clean(str(pdf_path))
-        else:
-            data = extract_scanned_clean(str(pdf_path))
-    except Exception as e:
-        logger.error(f"{fname}: extraction failed: {e}")
-        _mark_finished(doc_id, "failed", error=f"extraction failed: {e}")
-        return False
 
     if not data.get("tables") and not data.get("texts"):
         logger.warning(f"{fname}: no data extracted")
@@ -211,7 +232,7 @@ def process_pdf(pdf_path: Path) -> bool:
     logger.info(f"{fname}: extracted {len(data.get('tables', []))} tables, "
                 f"{len(data.get('texts', []))} text blocks")
 
-    # 3. Save raw extraction (exclude "images" — PIL images aren't JSON-serializable)
+    # Save raw extraction (exclude "images" — PIL images aren't JSON-serializable)
     try:
         OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
         JSON_RAW_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -222,18 +243,18 @@ def process_pdf(pdf_path: Path) -> bool:
     except Exception as e:
         logger.warning(f"{fname}: could not save raw JSON (continuing anyway): {e}")
 
-    # 4. Send dict to Gemini (+ Gemma vision fallback if needed)
+    # Send dict to Gemini (+ Gemma vision fallback if needed).
+    # get_invoice_json_from_data() now returns (result, usage) — usage is
+    # this file's own local totals, safe to use directly with no risk of
+    # another thread's numbers mixing in.
     try:
-        result = get_invoice_json_from_data(data, pdf_path=str(pdf_path))
+        result, usage = get_invoice_json_from_data(data, pdf_path=str(pdf_path))
     except Exception as e:
         logger.error(f"{fname}: LLM extraction failed: {e}")
-        usage = get_usage_totals()
-        _mark_finished(doc_id, "failed", error=f"LLM extraction failed: {e}",
-                        tokens_used=usage["input_tokens"] + usage["output_tokens"],
-                        cost=usage["cost"])
+        _mark_finished(doc_id, "failed", error=f"LLM extraction failed: {e}")
         return False
 
-    # 5. Save clean JSON
+    # Save clean JSON
     try:
         JSON_FOLDER.mkdir(parents=True, exist_ok=True)
         json_path = JSON_FOLDER / f"{doc_id}.json"
@@ -241,17 +262,83 @@ def process_pdf(pdf_path: Path) -> bool:
         logger.info(f"{fname}: saved final JSON -> {json_path}")
     except Exception as e:
         logger.error(f"{fname}: failed to save final JSON: {e}")
-        usage = get_usage_totals()
         _mark_finished(doc_id, "failed", error=f"failed to save output: {e}",
                         tokens_used=usage["input_tokens"] + usage["output_tokens"],
                         cost=usage["cost"])
         return False
 
-    usage = get_usage_totals()
     _mark_finished(doc_id, "success",
                     tokens_used=usage["input_tokens"] + usage["output_tokens"],
                     cost=usage["cost"])
     return True
+
+
+# ─────────────────────────────────────────────────────────
+# DIGITAL PATH — one file per worker thread (no GPU involved, so the
+# original "many threads at once" approach is still the right one here)
+# ─────────────────────────────────────────────────────────
+
+def process_digital_pdf(pdf_path: Path) -> bool:
+    fname = pdf_path.name
+    doc_id = pdf_path.stem
+    logger.info(f"Processing (digital): {fname}")
+    _mark_started(doc_id, fname)
+
+    try:
+        data = extract_digital_clean(str(pdf_path))
+    except Exception as e:
+        logger.error(f"{fname}: extraction failed: {e}")
+        _mark_finished(doc_id, "failed", error=f"extraction failed: {e}")
+        return False
+
+    return _process_extracted(pdf_path, data)
+
+
+# ─────────────────────────────────────────────────────────
+# SCANNED PATH — grouped into GPU-efficient OCR batches.
+# ─────────────────────────────────────────────────────────
+
+def process_scanned_batch(batch_paths: List[Path], workers: int) -> Tuple[int, int]:
+    """
+    Runs OCR for a WHOLE group of scanned PDFs in one GPU call
+    (extract_scanned_batch), then runs the LLM extraction for each file
+    in that group concurrently in a small thread pool — since that part
+    is network-bound (waiting on Gemini/Gemma), not GPU work, it's fine
+    for several of those to happen at the same time.
+    """
+    for p in batch_paths:
+        _mark_started(p.stem, p.name)
+
+    logger.info(f"Running OCR batch: {len(batch_paths)} scanned PDF(s)")
+    try:
+        batch_data = extract_scanned_batch([str(p) for p in batch_paths])
+    except Exception as e:
+        logger.error(f"OCR batch failed entirely: {e}")
+        for p in batch_paths:
+            _mark_finished(p.stem, "failed", error=f"OCR batch failed: {e}")
+        return 0, len(batch_paths)
+
+    success = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_process_extracted, p, batch_data.get(str(p), {})): p
+            for p in batch_paths
+        }
+        for future in as_completed(futures):
+            p = futures[future]
+            try:
+                ok = future.result()
+            except Exception as e:
+                logger.error(f"{p.name}: unexpected worker error: {e}")
+                ok = False
+
+            if ok:
+                success += 1
+            else:
+                failed += 1
+
+    return success, failed
 
 
 # ─────────────────────────────────────────────────────────
@@ -279,7 +366,7 @@ def main():
     logger.info("=" * 60)
     logger.info("INVOICE EXTRACTION PIPELINE — BATCH MODE")
     logger.info(f"Device: {config.DEVICE} | Workers: {args.workers} | "
-                f"OCR workers: {config.OCR_WORKERS} | OCR batch size: {config.OCR_BATCH_SIZE}")
+                f"OCR batch size: {config.OCR_BATCH_SIZE}")
     logger.info("=" * 60)
 
     # Check that model names actually work BEFORE processing thousands of files
@@ -316,34 +403,43 @@ def main():
         print_summary()
         return
 
-    logger.info(f"Starting batch: {len(pdfs)} file(s) to process, {args.workers} worker(s)")
+    # Detect type for every file FIRST, so we know which go through the
+    # digital thread-pool path vs. the scanned OCR-batch path.
+    digital_pdfs, scanned_pdfs = classify_pdfs(pdfs)
+    logger.info(f"Classified: {len(digital_pdfs)} digital, {len(scanned_pdfs)} scanned/mixed")
+    logger.info(f"Starting batch: {len(pdfs)} file(s) total, {args.workers} worker(s)")
 
     total_start = time.time()
     success = 0
     failed = 0
 
-    # Process multiple files at the same time using a worker pool.
-    # This helps a lot because most of the time is spent WAITING for the
-    # AI's response — while one file is waiting, another file's turn can
-    # start, instead of everything waiting in a single line.
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        future_to_pdf = {executor.submit(process_pdf, pdf): pdf for pdf in pdfs}
+    # --- Digital PDFs: one thread per file (no GPU involved) ---
+    if digital_pdfs:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_pdf = {executor.submit(process_digital_pdf, pdf): pdf for pdf in digital_pdfs}
+            for future in as_completed(future_to_pdf):
+                pdf = future_to_pdf[future]
+                try:
+                    ok = future.result()
+                except Exception as e:
+                    logger.error(f"{pdf.name}: unexpected worker error: {e}")
+                    ok = False
 
-        for future in as_completed(future_to_pdf):
-            pdf = future_to_pdf[future]
-            try:
-                ok = future.result()
-            except Exception as e:
-                logger.error(f"{pdf.name}: unexpected worker error: {e}")
-                ok = False
+                success += int(ok)
+                failed += int(not ok)
+                logger.info(f"Progress: {success + failed}/{len(pdfs)} "
+                            f"(success: {success}, failed: {failed})")
 
-            if ok:
-                success += 1
-            else:
-                failed += 1
-
-            done_count = success + failed
-            logger.info(f"Progress: {done_count}/{len(pdfs)} "
+    # --- Scanned/mixed PDFs: grouped into GPU-efficient OCR batches ---
+    if scanned_pdfs:
+        batches = create_pdf_aware_batches([str(p) for p in scanned_pdfs], config.OCR_BATCH_SIZE)
+        for i, batch in enumerate(batches, 1):
+            batch_paths = [Path(p) for p in batch]
+            logger.info(f"OCR batch {i}/{len(batches)}: {len(batch_paths)} PDF(s)")
+            b_success, b_failed = process_scanned_batch(batch_paths, args.workers)
+            success += b_success
+            failed += b_failed
+            logger.info(f"Progress: {success + failed}/{len(pdfs)} "
                         f"(success: {success}, failed: {failed})")
 
     total_time = time.time() - total_start

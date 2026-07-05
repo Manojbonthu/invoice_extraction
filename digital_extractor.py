@@ -14,6 +14,13 @@ WHAT'S NEW (in simple words):
   4. render_page_images() now also uses config.OCR_DPI as its default,
      so digital and scanned PDFs render pages at a consistent,
      device-appropriate resolution.
+
+FIXED: extract_digital_clean() was calling len(doc) in its final log
+line AFTER doc.close() had already run in the `finally` block. PyMuPDF
+raises RuntimeError("document closed") the instant you touch a closed
+Document — that's what was crashing every digital PDF instantly, before
+it ever reached the LLM step. Page count is now captured up front while
+the doc is still open.
 """
 
 import os
@@ -163,6 +170,7 @@ def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
     """
     doc = fitz.open(pdf_path)
     result = {"tables": [], "texts": []}
+    page_count = len(doc)  # captured while doc is still open — used in the log line below
 
     try:
         for page_index, page in enumerate(doc, start=1):
@@ -221,7 +229,7 @@ def extract_digital_clean(pdf_path: str) -> Dict[str, Any]:
 
     logger.info(f"Digital extraction finished for {pdf_path}: "
                 f"{len(result['tables'])} table(s), {len(result['texts'])} text block(s) "
-                f"across {len(doc)} page(s)")
+                f"across {page_count} page(s)")
     return result
 
 

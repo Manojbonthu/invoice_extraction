@@ -18,12 +18,25 @@ WHAT'S NEW (in simple words):
   5. Each text block now also stores which PAGE it came from. This is
      needed later for multi-page invoices, so we know which page to show
      to the Gemma vision fallback if a field is missing.
+
+  NEW — CROSS-PDF BATCHING (create_pdf_aware_batches + extract_scanned_batch):
+     Before this, if you had 10 scanned PDFs and several worker threads,
+     each thread called the OCR model separately for its own PDF — many
+     threads fighting over the same GPU model at once. That risks GPU
+     out-of-memory errors and wastes GPU time on lots of small calls
+     instead of one efficient big one.
+
+     Now, run.py can gather up several scanned PDFs, group them by total
+     PAGE COUNT (never splitting one PDF's pages across two groups), and
+     send ALL of a group's pages through the OCR model in ONE call. This
+     keeps GPU usage to one big, orderly batch at a time instead of many
+     threads competing for the same model.
 """
 
 import re
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
 
 import pypdfium2 as pdfium
 from PIL import Image
@@ -93,6 +106,17 @@ def pdf_to_images(pdf_path: str, dpi: int = None) -> List[Image.Image]:
     return images
 
 
+def _count_pages(pdf_path: str) -> int:
+    """How many pages does this PDF have? Used to build page-budget
+    batches without ever having to fully render a PDF just to count it."""
+    try:
+        pdf = pdfium.PdfDocument(pdf_path)
+        return len(pdf)
+    except Exception as e:
+        logger.error(f"Could not count pages for {pdf_path}: {e}")
+        return 0
+
+
 def _lines_to_paragraphs(page_pred) -> List[str]:
     """Sort lines top-to-bottom/left-to-right, group into paragraphs by vertical gap."""
     lines = []
@@ -140,21 +164,16 @@ def _batched(items: list, batch_size: int):
 
 def extract_scanned_clean(pdf_path: str, dpi: int = None) -> Dict[str, Any]:
     """
-    Extract plain OCR text from a scanned PDF.
+    Extract plain OCR text from ONE scanned PDF (single-file version —
+    still used by test scripts / one-off runs). For processing MANY
+    scanned PDFs efficiently on a GPU, see create_pdf_aware_batches() +
+    extract_scanned_batch() below instead.
 
     Returns: {
         "tables": [],
         "texts": [{"type": "text"/"heading", "text": "...", "page": 1}, ...],
         "images": [PIL.Image, ...]   # one image per page, same order
     }
-
-    The "page" number (starting at 1) is now included on every text block,
-    so later steps (like the Gemma vision fallback) know exactly which
-    page image to look at if a field is still missing.
-
-    The images are the same page pictures already used for OCR — we keep
-    them here instead of throwing them away, so we don't have to redo the
-    PDF-to-image conversion again later.
     """
     recognition_predictor, detection_predictor = _get_predictors()
     images = pdf_to_images(pdf_path, dpi=dpi)
@@ -195,6 +214,116 @@ def extract_scanned_text_only(pdf_path: str, dpi: int = None) -> str:
     """
     data = extract_scanned_clean(pdf_path, dpi=dpi)
     return "\n".join(t["text"] for t in data["texts"])
+
+
+# ─────────────────────────────────────────────────────────
+# NEW: CROSS-PDF PAGE-BUDGET BATCHING
+# Groups several scanned PDFs together so one OCR call can handle all of
+# them at once, instead of one call per PDF fighting over the same GPU.
+# ─────────────────────────────────────────────────────────
+
+def create_pdf_aware_batches(pdf_paths: List[str], batch_size: int = None) -> List[List[str]]:
+    """
+    Groups PDFs into batches where the total PAGE COUNT per batch stays
+    within batch_size, WITHOUT ever splitting one PDF's pages across two
+    batches.
+
+    Example with batch_size=10:
+      PDF A (4 pages), PDF B (3 pages), PDF C (5 pages), PDF D (2 pages)
+      -> Batch 1: [A, B]   (4+3=7 pages, adding C would make 12 > 10)
+      -> Batch 2: [C, D]   (5+2=7 pages)
+
+    A single PDF bigger than batch_size gets its own batch by itself —
+    it's never split.
+    """
+    batch_size = batch_size or config.OCR_BATCH_SIZE
+    batches: List[List[str]] = []
+    current_batch: List[str] = []
+    current_pages = 0
+
+    for pdf_path in pdf_paths:
+        count = _count_pages(pdf_path)
+        if count == 0:
+            logger.warning(f"Skipping unreadable/empty PDF for OCR batching: {pdf_path}")
+            continue
+
+        if current_batch and (current_pages + count > batch_size):
+            batches.append(current_batch)
+            current_batch = []
+            current_pages = 0
+
+        current_batch.append(pdf_path)
+        current_pages += count
+
+    if current_batch:
+        batches.append(current_batch)
+
+    logger.info(f"Grouped {len(pdf_paths)} scanned PDF(s) into {len(batches)} OCR batch(es) "
+                f"(page budget per batch: {batch_size})")
+    return batches
+
+
+def extract_scanned_batch(pdf_paths: List[str], dpi: int = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Runs OCR on MULTIPLE scanned PDFs together, in ONE call to the model,
+    instead of one call per PDF. This is the GPU-efficient version of
+    extract_scanned_clean() — call create_pdf_aware_batches() first to
+    build a sensible group of PDFs to pass in here (one whose total page
+    count fits your OCR_BATCH_SIZE).
+
+    Returns: { pdf_path: {"tables": [], "texts": [...], "images": [...]}, ... }
+    — same per-file shape as extract_scanned_clean() has always returned,
+    just for many files at once, so the rest of the pipeline (llm_extractor.py)
+    doesn't need to know or care that these were batched together.
+    """
+    recognition_predictor, detection_predictor = _get_predictors()
+
+    all_images: List[Image.Image] = []
+    page_metadata: List[Tuple[str, int]] = []  # (pdf_path, page_number starting at 1)
+    results: Dict[str, Dict[str, Any]] = {
+        p: {"tables": [], "texts": [], "images": []} for p in pdf_paths
+    }
+
+    # Render every page of every PDF in this group first, all into one
+    # flat list, remembering which (pdf, page number) each image came from.
+    for pdf_path in pdf_paths:
+        try:
+            images = pdf_to_images(pdf_path, dpi=dpi)
+        except Exception as e:
+            logger.error(f"Could not render pages for {pdf_path}: {e}")
+            continue
+        results[pdf_path]["images"] = images
+        for page_num, img in enumerate(images, start=1):
+            all_images.append(img)
+            page_metadata.append((pdf_path, page_num))
+
+    if not all_images:
+        logger.warning("No pages rendered for this OCR batch — nothing to OCR.")
+        return results
+
+    logger.info(f"Running OCR on {len(all_images)} page(s) across {len(pdf_paths)} PDF(s) "
+                f"in ONE call (device {config.DEVICE})")
+
+    # ONE call to the model for the whole group — this is the part that
+    # actually fixes the "many threads fighting over one GPU" problem.
+    page_preds = recognition_predictor(all_images, det_predictor=detection_predictor)
+
+    # Sort the flat OCR results back out into their original per-PDF,
+    # per-page buckets.
+    for (pdf_path, page_num), page_pred in zip(page_metadata, page_preds):
+        for para in _lines_to_paragraphs(page_pred):
+            is_heading = para.isupper() and len(para) < 100
+            results[pdf_path]["texts"].append({
+                "type": "heading" if is_heading else "text",
+                "text": para,
+                "page": page_num,
+            })
+
+    for pdf_path, result in results.items():
+        logger.info(f"OCR finished for {pdf_path}: {len(result['texts'])} text block(s) "
+                    f"across {len(result['images'])} page(s)")
+
+    return results
 
 
 if __name__ == "__main__":
